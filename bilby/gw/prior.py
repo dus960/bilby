@@ -14,6 +14,7 @@ from ..core.prior import (
     JointPriorDistError,
 )
 from ..core.utils import infer_args_from_method, logger, random, WrappedInterp1d as interp1d
+from ..compat.utils import xp_wrap
 from .conversion import (
     convert_to_lal_binary_black_hole_parameters,
     convert_to_lal_binary_neutron_star_parameters, generate_mass_parameters,
@@ -1895,11 +1896,20 @@ class TOVJointDist(BaseJointPriorDist):
         lam = 10 ** log10_lambda
         return np.column_stack([mass, lam])
 
-    def _sample(self, size, **kwargs):
-        u = random.rng.uniform(0, 1, size=(size, 2))
+    def _sample(self, size, *, random_state=None, **kwargs):
+        # BaseJointPriorDist.sample passes random_state through; honour it so
+        # seeded runs are reproducible and pool workers get distinct streams.
+        rng = random.resolve_random_state(random_state)
+        u = rng.uniform(0, 1, size=(size, 2))
         return self._rescale(u)
 
-    def _ln_prob(self, samp, lnprob, outbounds):
+    @xp_wrap
+    def _ln_prob(self, samp, lnprob, outbounds, *, xp=None):
+        # `xp` is supplied by BaseJointPriorDist.ln_prob. The KDE is evaluated
+        # with a scipy RegularGridInterpolator, which is numpy-only, so the
+        # interpolation is done in numpy and converted back on the way out.
+        # This makes the class numpy-bound: an xp of cupy/jax would fail here.
+        samp = np.asarray(samp)
         mass = samp[:, 0]
         lam = samp[:, 1]
         log10_lam = np.log10(np.clip(lam, 1e-300, None))
@@ -1907,7 +1917,29 @@ class TOVJointDist(BaseJointPriorDist):
         # Jacobian for p(mass, log10 Lambda) -> p(mass, Lambda):
         # p(mass, Lambda) = p(mass, log10 Lambda) / (Lambda * ln(10))
         lnprob_vals = log_pdf_val - np.log(lam) - np.log(10.0)
-        return np.where(outbounds, -np.inf, lnprob_vals)
+        return xp.where(xp.asarray(outbounds), -np.inf, xp.asarray(lnprob_vals))
+
+    @xp_wrap
+    def ln_prob(self, value, *, xp=None):
+        """Log-probability of a sample, as a scalar for single samples.
+
+        BaseJointPriorDist.ln_prob ends in ``return lnprob[()]``, which unwraps
+        0-d arrays but leaves a single-sample result at shape (1,). Ordinary
+        priors return floats, so PriorDict.ln_prob's ``xp.asarray([...])`` over
+        the whole prior set then raises
+
+            ValueError: setting an array element with a sequence. The requested
+            array has an inhomogeneous shape after 1 dimensions.
+
+        ``rescale`` already squeezes the equivalent case (see
+        BaseJointPriorDist.rescale); this brings ln_prob into line. Kept local
+        to TOVJointDist rather than fixed in the base class so this fork stays a
+        clean addition on top of upstream. Harmless if upstream is fixed later.
+        """
+        lnprob = super().ln_prob(value, xp=xp)
+        if getattr(lnprob, "shape", None) == (1,):
+            lnprob = lnprob[0]
+        return lnprob
 
 
 class TOVJointPrior(JointPrior):
@@ -1936,3 +1968,24 @@ class TOVJointPrior(JointPrior):
         if not isinstance(dist, TOVJointDist):
             raise JointPriorDistError("dist object must be instance of TOVJointDist")
         super(TOVJointPrior, self).__init__(dist=dist, name=name, latex_label=latex_label, unit=unit)
+
+    def sample(self, size=1, *, random_state=None, **kwargs):
+        """Draw a sample, returning a scalar rather than a 0-d array.
+
+        JointPrior.sample ends in ``return sample.squeeze()``. For a size-1 draw
+        squeeze yields ``array(1.46)`` - a 0-d ndarray, not a float. That then
+        reaches lalsimulation's SimInspiralWaveformParamsInsertTidalLambda1,
+        whose SWIG REAL8 typemap rejects arrays of any shape:
+
+            TypeError: in method 'SimInspiralWaveformParamsInsertTidalLambda1',
+                       argument 2 of type 'REAL8'
+
+        Indexing with ``[()]`` unwraps 0-d arrays to numpy scalars and leaves
+        larger results untouched - the idiom BaseJointPriorDist.sample already
+        uses. It is also a no-op on numpy scalars, so this stays correct if
+        upstream is fixed later.
+
+        Note the masses only avoided this by luck: they are multiplied by
+        lal.MSUN_SI before reaching LAL, which collapses them to numpy scalars.
+        """
+        return super().sample(size=size, random_state=random_state, **kwargs)[()]

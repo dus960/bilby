@@ -21,7 +21,7 @@ COPY pyproject.toml requirements.txt gw_requirements.txt jax_requirements.txt \
 COPY bilby /src/bilby
 COPY cli_bilby /src/cli_bilby
 
-RUN conda install -c conda-forge numpy==2.3.5 scipy ezdag gwpy lalsuite bilby_pipe
+RUN conda install -c conda-forge numpy==2.3.5 scipy ezdag gwpy lalsuite bilby_pipe beartype rich
 
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir --no-deps -r requirements.txt && \
@@ -30,8 +30,6 @@ RUN pip install --no-cache-dir --upgrade pip && \
 RUN rm -rf /src/*
 
 COPY prob_data/* /gw170817_data/
-
-COPY gw170817_data/* /gw170817_data/
 
 WORKDIR /srv
 
