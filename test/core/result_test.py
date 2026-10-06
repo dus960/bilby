@@ -625,6 +625,77 @@ class TestResult(unittest.TestCase):
         assert isinstance(cached_result, NotAResult)
 
 
+class TestResultWithLalDict(unittest.TestCase):
+    """Regression tests for https://github.com/bilby-dev/bilby/issues/751
+
+    A :code:`lal.Dict` embedded in :code:`meta_data` (e.g. a waveform
+    generator's :code:`lal_waveform_dictionary`) must survive a save/load
+    round trip without any special-casing in :code:`Result`, relying only on
+    the generic :code:`lal.Dict` encode/decode pairs in
+    :code:`bilby.core.utils.io`.
+    """
+
+    @pytest.fixture(autouse=True)
+    def init_outdir(self, tmp_path):
+        self.outdir = str(tmp_path / "test")
+
+    def setUp(self):
+        import lal
+
+        np.random.seed(7)
+        lal_dict = lal.CreateDict()
+        lal.DictInsertREAL8Value(lal_dict, "test_value", 1.23)
+        priors = bilby.prior.PriorDict(
+            dict(x=bilby.prior.Uniform(0, 1, "x"))
+        )
+        result = bilby.core.result.Result(
+            label="label",
+            outdir=self.outdir,
+            sampler="emcee",
+            search_parameter_keys=["x"],
+            priors=priors,
+            sampler_kwargs=dict(),
+            meta_data=dict(
+                likelihood=dict(
+                    waveform_arguments=dict(lal_waveform_dictionary=lal_dict)
+                )
+            ),
+        )
+        result.posterior = pd.DataFrame(dict(x=np.random.normal(0, 1, 10)))
+        self.result = result
+
+    def tearDown(self):
+        try:
+            shutil.rmtree(self.outdir)
+        except OSError:
+            pass
+
+    def _get_lal_dict(self, result):
+        return result.meta_data["likelihood"]["waveform_arguments"][
+            "lal_waveform_dictionary"
+        ]
+
+    def test_save_and_load_json(self):
+        self._save_and_load_test(extension="json")
+
+    def test_save_and_load_hdf5(self):
+        self._save_and_load_test(extension="hdf5")
+
+    def _save_and_load_test(self, extension):
+        import lal
+
+        self.result.save_to_file(extension=extension, overwrite=True)
+        loaded_result = bilby.core.result.read_in_result(
+            outdir=self.result.outdir, label=self.result.label, extension=extension
+        )
+        loaded_lal_dict = self._get_lal_dict(loaded_result)
+        self.assertIsInstance(loaded_lal_dict, lal.Dict)
+        self.assertEqual(
+            lal.DictLookupREAL8Value(self._get_lal_dict(self.result), "test_value"),
+            lal.DictLookupREAL8Value(loaded_lal_dict, "test_value"),
+        )
+
+
 class TestResultListError(unittest.TestCase):
     def setUp(self):
         np.random.seed(7)
@@ -882,7 +953,7 @@ class TestReweight(unittest.TestCase):
             log_evidence=-np.log(10),
         )
 
-    def _run_reweighting(self, sigma):
+    def _run_reweighting(self, sigma, npool=None):
         likelihood_1 = SimpleGaussianLikelihood()
         likelihood_2 = SimpleGaussianLikelihood(sigma=sigma)
         original_ln_likelihoods = list()
@@ -892,7 +963,11 @@ class TestReweight(unittest.TestCase):
         self.result.posterior["log_likelihood"] = original_ln_likelihoods
         self.original_ln_likelihoods = original_ln_likelihoods
         return bilby.core.result.reweight(
-            self.result, likelihood_1, likelihood_2, verbose_output=True
+            self.result,
+            likelihood_1,
+            likelihood_2,
+            verbose_output=True,
+            npool=npool,
         )
 
     def test_reweight_same_likelihood_weights_1(self):
@@ -900,6 +975,13 @@ class TestReweight(unittest.TestCase):
         When the likelihoods are the same, the weights should be 1.
         """
         _, weights, _, _, _, _ = self._run_reweighting(sigma=1)
+        self.assertLess(min(abs(weights - 1)), 1e-10)
+
+    def test_reweight_same_likelihood_weights_1_with_pool(self):
+        """
+        When the likelihoods are the same, the weights should be 1.
+        """
+        _, weights, _, _, _, _ = self._run_reweighting(sigma=1, npool=2)
         self.assertLess(min(abs(weights - 1)), 1e-10)
 
     @pytest.mark.flaky(reruns=3)
