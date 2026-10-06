@@ -1,0 +1,1060 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage[most]{tcolorbox}
+\usepackage[htt]{hyphenat} % lets \texttt names break at underscores
+\makeatletter\g@addto@macro\@verbatim\small\makeatother % code blocks fit the text width
+\hypersetup{colorlinks=true,linkcolor=blue!50!black,urlcolor=blue!50!black}
+
+\newcommand{\Mc}{\mathcal{M}}
+\newcommand{\lt}{\tilde{\Lambda}}
+\newcommand{\dlt}{\delta\tilde{\Lambda}}
+\newcommand{\dd}{\mathrm{d}}
+\newcommand{\code}[1]{\texttt{#1}}
+
+% A boxed note for bugs found and fixed in the code, placed next to the
+% derivation or mechanism they concern.
+\newtcolorbox{bugnote}[1]{colback=red!3!white,colframe=red!45!black,
+  fonttitle=\bfseries,title={Bug (fixed): #1},breakable}
+% A boxed note for known limitations that are not fixed.
+\newtcolorbox{caveat}[1]{colback=yellow!4!white,colframe=yellow!45!black,
+  coltitle=black,fonttitle=\bfseries,title={Caveat: #1},breakable}
+
+\title{TOV-informed joint priors in \code{bilby.gw.prior}:\\
+$(m, \Lambda)$ and $(\Mc,\, q,\, \lt,\, \dlt)$}
+\author{Derivation and implementation notes}
+\date{\today}
+
+\begin{document}
+\sloppy
+\maketitle
+
+\begin{abstract}
+\noindent
+The equation of state (EOS) correlates a neutron star's mass with its tidal
+deformability $\Lambda$. These notes document three priors in
+\code{bilby/gw/prior.py} that carry that correlation from a gridded KDE of TOV
+mass--$\Lambda$ sequences into a bilby run. \code{TOVJointDist} and
+\code{TOVJointPrior} put it on a single $(m, \Lambda)$ pair, one instance per
+star. \code{TOVMassLambdaTildeJointDist} and \code{TOVMassLambdaTildeJointPrior}
+push two such pairs through the exact change of variables to the usual BNS
+sampling parameters $(\Mc, q, \lt, \dlt)$. \code{TOVConditionalLambdaPrior}
+puts only the conditional $p(\Lambda \mid m)$ on each star's deformability and
+leaves the masses to whatever prior the run already uses. For each, we derive
+the density evaluated by \code{ln\_prob} and the unit-cube transform used by
+\code{rescale}, show that the two agree, and describe how the classes plug into
+bilby's prior machinery. Bugs found and fixed along the way are recorded
+where they occur.
+\end{abstract}
+
+\tableofcontents
+
+%======================================================================
+\section{Overview}
+%======================================================================
+
+\begin{table}[h]
+\centering
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+Class / function & Role \\
+\midrule
+\code{TOVJointDist(grid\_file, names, bounds=None)} &
+  Joint distribution of one star's $(m, \Lambda)$; owns the grid and all the
+  tables derived from it (Sections~\ref{sec:grid}--\ref{sec:single}). \\
+\code{TOVJointPrior(dist, name)} &
+  Per-parameter \code{JointPrior} wrapper; two per star. \\
+\code{TOVMassLambdaTildeJointDist(grid\_file, names=None, bounds=None)} &
+  Joint distribution of $(\Mc, q, \lt, \dlt)$ for a binary; holds a
+  \code{TOVJointDist} internally as \code{\_grid} and reuses its tables
+  (Section~\ref{sec:binary}). \\
+\code{TOVMassLambdaTildeJointPrior(dist, name)} &
+  Per-parameter \code{JointPrior} wrapper; four per binary. \\
+\code{TOVConditionalLambdaPrior(grid\_file, component, ...)} &
+  Conditional prior $p(\Lambda \mid m)$ on one star's deformability, for use
+  with an independent mass prior; one per star (Section~\ref{sec:conditional}). \\
+\code{\_lambda\_tilde\_coefficients(eta)} &
+  The coefficients $c_1,\dots,c_4$ of the tidal map (Eq.~\ref{eq:coeffs}). \\
+\code{\_ln\_abs\_det\_lambda\_tilde\_jacobian(eta)} &
+  $\ln\lvert\det A(\eta)\rvert$ of the tidal map (Eq.~\ref{eq:tidaljac}). \\
+\bottomrule
+\end{tabularx}
+\caption{The public surface. Both \code{Dist} classes derive from
+\code{bilby.core.prior.BaseJointPriorDist}, and both joint \code{Prior} classes
+derive from \code{bilby.core.prior.JointPrior}.
+\code{TOVConditionalLambdaPrior} derives from
+\code{bilby.core.prior.ConditionalBasePrior} instead, because it conditions on
+parameters it does not own.}
+\end{table}
+
+\noindent
+Each \code{Dist} implements the three methods bilby expects of a joint
+distribution: \code{\_ln\_prob} (density), \code{\_rescale} (unit-cube
+transform, used by nested samplers) and \code{\_sample} (random draws). A
+sampler only ever reaches them through the per-parameter \code{Prior} objects
+and a \code{PriorDict}; Section~\ref{sec:machinery} covers that layer.
+
+%======================================================================
+\section{The input grid}
+\label{sec:grid}
+%======================================================================
+
+\subsection{File format}
+
+The EOS information enters through a single file,
+\code{prob\_data/tov\_mass\_lambda\_joint\_kde\_grid.npz}, loaded in
+\code{TOVJointDist.\_\_init\_\_}. It holds a two-dimensional KDE of TOV
+sequences over a population of equations of state:
+\begin{equation}
+  \code{log\_pdf}[i,j] \;=\; \ln p\big(m_i,\, \ell_j\big),
+  \qquad \ell \equiv \log_{10}\Lambda ,
+\end{equation}
+on grids \code{mass\_edges} ($N=200$ points, $m \in [1.000, 3.476]\,M_\odot$)
+and \code{log10\_lambda\_edges} ($M=200$ points, $\ell \in [0.568, 4.738]$). The
+grid is normalised, $\int p(m,\ell)\,\dd m\,\dd\ell = 1$. It is fitted offline
+because refitting the KDE to the full population per job, let alone per
+likelihood call, is prohibitive. Empty regions of the KDE are floored at
+$\ln p = \ln 10^{-300} = -690.8$ rather than $-\infty$.
+
+\subsection{Tables derived at construction}
+\label{sec:tables}
+
+\code{TOVJointDist.\_\_init\_\_} builds three objects from the grid, all by
+trapezoidal quadrature (\code{scipy.integrate.trapezoid} and
+\code{cumulative\_trapezoid}).
+
+\paragraph{The density interpolant.}
+\code{self.\_log\_pdf\_interp} is a SciPy \code{RegularGridInterpolator}
+over $(m, \ell)$, linear in $\ln p$ (so geometric in $p$), with
+\code{fill\_value=-inf} off the grid. It is used only by \code{ln\_prob}.
+
+\paragraph{The marginal mass CDF.}
+\begin{equation}
+  p(m) = \int p(m,\ell)\,\dd\ell,
+  \qquad
+  F(m) = \frac{\int_{m_{\min}}^{m} p(m')\,\dd m'}{\int_{m_{\min}}^{m_{\max}} p(m')\,\dd m'} ,
+  \label{eq:massmarg}
+\end{equation}
+tabulated at the mass grid points as \code{self.\_mass\_cdf} and explicitly
+renormalised so that $F(m_{\max}) = 1$. It is exposed as
+\code{TOVJointDist.mass\_cdf(mass)} (forward, linear interpolation) and
+\code{TOVJointDist.mass\_from\_cdf(u)} (inverse, linear interpolation of the
+same table with the axes swapped).
+
+\paragraph{The conditional CDF of $\ell$ given $m$.}
+\begin{equation}
+  p(\ell \mid m_i) = \frac{p(m_i,\ell)}{p(m_i)},
+  \qquad
+  G_i(\ell) = \int_{\ell_{\min}}^{\ell} p(\ell' \mid m_i)\,\dd\ell' ,
+  \label{eq:condcdf}
+\end{equation}
+one row per mass grid point, stored as \code{self.\_cond\_cdf} with shape
+$(N, M)$ and each row renormalised to end at $1$. Rows whose marginal
+$p(m_i)$ vanishes are guarded against division by zero.
+
+\subsection{From $\log_{10}\Lambda$ to $\Lambda$}
+\label{sec:log10jac}
+
+The grid is a density in $\ell = \log_{10}\Lambda$; every density these classes
+return is in $\Lambda$. With $\dd\ell/\dd\Lambda = 1/(\Lambda \ln 10)$,
+\begin{equation}
+  p(m, \Lambda) \;=\; \frac{p(m, \ell)}{\Lambda \ln 10},
+  \qquad\text{i.e.}\qquad
+  \ln p(m,\Lambda) = \ln p(m,\ell) - \ln \Lambda - \ln(\ln 10).
+  \label{eq:log10jac}
+\end{equation}
+The last term is $\ln(\ln 10) = 0.8340$. Equation~\eqref{eq:log10jac} is
+implemented once, in \code{TOVJointDist.ln\_pdf\_mass\_lambda(mass, lam)}, which
+both \code{Dist} classes call.
+
+\begin{bugnote}{$\ln 10$ in place of $\ln(\ln 10)$}
+The original \code{TOVJointDist.\_ln\_prob} computed
+\begin{center}
+\code{log\_pdf\_val - np.log(lam) - np.log(10.0)}
+\end{center}
+that is, $\ln 10 = 2.3026$ where Eq.~\eqref{eq:log10jac} requires
+$\ln(\ln 10) = 0.8340$. The log-density was low by the constant
+\begin{equation*}
+  \ln 10 - \ln(\ln 10) = \ln\!\left( \frac{10}{\ln 10} \right) = 1.4686
+\end{equation*}
+per $(m, \Lambda)$ pair, a factor of $4.34$ in density. Being constant, it
+did not bias posteriors, but it shifted log evidences and left the density
+unnormalised. It was found by the box estimator of Section~\ref{sec:verify}:
+the four-parameter prior, which contains two pairs, came out at
+$18.8 \approx 4.34^2$ instead of $1$. The fix moved the computation into
+\code{ln\_pdf\_mass\_lambda} so that both classes share the corrected line.
+\end{bugnote}
+
+%======================================================================
+\section{Single star: \code{TOVJointDist}}
+\label{sec:single}
+%======================================================================
+
+\subsection{Density}
+
+For parameters named \code{[mass\_name, lambda\_name]}, e.g.
+\code{["mass\_1", "lambda\_1"]}, the prior is the grid density itself,
+transformed to $\Lambda$:
+\begin{equation}
+  \ln p(m, \Lambda) = \ln p(m, \ell)\big|_{\text{interp}} - \ln\Lambda - \ln(\ln 10),
+  \label{eq:single}
+\end{equation}
+evaluated by \code{TOVJointDist.\_ln\_prob}, which forwards to
+\code{ln\_pdf\_mass\_lambda} and then sets out-of-bounds samples to $-\infty$.
+The default \code{bounds} are the grid's own extent,
+$m \in [m_{\min}, m_{\max}]$ and $\Lambda \in [10^{\ell_{\min}}, 10^{\ell_{\max}}]$,
+so the support is a box and coincides with where the interpolant is defined.
+
+\subsection{Prior transform}
+\label{sec:single_rescale}
+
+\code{TOVJointDist.\_rescale} maps $u = (u_0, u_1) \in [0,1]^2$ to $(m, \Lambda)$
+by sequential inverse-CDF sampling, mass first and then $\ell$ given that mass:
+\begin{equation}
+  m = F^{-1}(u_0),
+  \qquad
+  \ell = G^{-1}(u_1 \mid m),
+  \qquad
+  \Lambda = 10^{\ell} ,
+  \label{eq:single_rescale}
+\end{equation}
+which samples $p(m)\,p(\ell \mid m) = p(m, \ell)$, as required. The first step is
+\code{mass\_from\_cdf}; the second is
+\code{log10\_lambda\_from\_cdf(u, mass)}. Since $G$ is tabulated only at the mass
+grid points, the latter blends the two neighbouring rows linearly in mass
+before inverting:
+\begin{equation}
+  G(\ell \mid m) = (1-w)\, G_{i}(\ell) + w\, G_{i+1}(\ell),
+  \qquad
+  w = \frac{m - m_i}{m_{i+1} - m_i}, \quad m_i \le m < m_{i+1}.
+  \label{eq:rowblend}
+\end{equation}
+The blended row is still a monotone CDF, so the inversion is well defined.
+\code{\_sample} draws $u$ uniformly and calls \code{\_rescale}, so random draws
+and the prior transform share one code path.
+
+\subsection{Is \code{ln\_prob} the density that \code{rescale} samples from?}
+\label{sec:discretisation}
+
+Both describe the same KDE, but they discretise it differently.
+\code{rescale} inverts piecewise-linear CDFs, so the density it actually
+samples is piecewise constant: on each mass cell,
+\begin{equation}
+  p_{\mathrm{r}}(m) = \frac{F(m_{i+1}) - F(m_i)}{m_{i+1} - m_i},
+  \qquad
+  p_{\mathrm{r}}(\ell \mid m) = \frac{G(\ell_{j+1} \mid m) - G(\ell_j \mid m)}{\ell_{j+1} - \ell_j},
+  \label{eq:rescale_density}
+\end{equation}
+with $G(\cdot \mid m)$ the blended row of Eq.~\eqref{eq:rowblend}.
+\code{ln\_prob} instead interpolates $\ln p$ bilinearly. The two coincide at the
+grid points and differ inside cells, most where $\ln p$ changes quickly.
+
+The size of the difference follows from importance-weighting draws from
+\code{rescale} by $w = p_{\mathrm{lnprob}} / p_{\mathrm{r}}$, both
+evaluated in $(m, \ell)$. Then $\mathbb{E}[w] = \int p_{\mathrm{lnprob}}$ is the
+normalisation of $\exp(\code{ln\_prob})$, and the $w$-weighted quantiles are
+the quantiles a sampler driven by \code{ln\_prob} (MCMC) converges to. With
+$2\times10^6$ draws:
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+& $\int \exp(\code{ln\_prob})$ & largest quantile shift, 5--99\% \\
+\midrule
+\code{TOVJointDist} $(m, \Lambda)$ & $0.9987$ & $0.3\%$ (in $\Lambda$ at 99\%) \\
+\code{TOVMassLambdaTildeJointDist} & $0.9975$ & $0.3\%$ (in $\dlt$ at 99\%) \\
+\bottomrule
+\end{tabular}
+\end{center}
+For practical purposes the two are the same density. A nested sampler (driven
+by \code{rescale}) and an MCMC sampler (driven by \code{ln\_prob}) target the
+same prior to well under a percent, and evidences computed with
+$\exp(\code{ln\_prob})$ are normalised to $0.25\%$.
+
+\begin{caveat}{the density is not strictly positive on its own support}
+Linear inversion occasionally places a draw in a cell where the KDE was
+floored, so $\ln p \approx -690$ there. This affects about $10^{-5}$ of draws
+(6 in $4\times10^5$ for the four-parameter prior, with minimum
+$\ln p = -626$). It is harmless for sampling, but it makes estimators that
+divide by $p$, such as a smooth importance sampler $\mathbb{E}_p[q/p]$ with a
+Gaussian $q$, diverge. Weight-based diagnostics need a truncated proposal; the
+box estimator of Section~\ref{sec:verify} does not have this problem.
+\end{caveat}
+
+\subsection{Using it for a binary}
+\label{sec:pairs}
+
+For a binary, create two independent instances, one per star:
+\begin{verbatim}
+    d1 = TOVJointDist(grid, names=["mass_1", "lambda_1"])
+    d2 = TOVJointDist(grid, names=["mass_2", "lambda_2"])
+    for d in (d1, d2):
+        for name in d.names:
+            priors[name] = TOVJointPrior(d, name)
+\end{verbatim}
+This models the two stars as independent draws from the EOS population, the
+same assumption as Eq.~\eqref{eq:component} below. It does \emph{not} impose
+$m_1 \ge m_2$: half of all draws have \code{mass\_2 > mass\_1}. Runs that rely
+on bilby's labelling convention should add a \code{Constraint} on
+\code{mass\_ratio}, or use the four-parameter class, which imposes the ordering
+exactly.
+
+The masses here come from the TOV distribution itself. To keep a run's own mass
+prior and apply the EOS only to $\Lambda$, use
+\code{TOVConditionalLambdaPrior} (Section~\ref{sec:conditional}). Registering
+a \code{TOVJointPrior} for \code{lambda\_1} alone, alongside an ordinary
+\code{mass\_1} prior, does not do this. Because the joint prior waits for a mass
+it never receives, \code{rescale} fails with an inhomogeneous-shape error,
+\code{ln\_prob} silently returns $0$ for every $\Lambda$, and \code{sample()}
+draws $\Lambda$ at a hidden mass of its own, uncorrelated with \code{mass\_1}.
+
+\begin{bugnote}{sibling instances merged during \code{rescale}}
+\code{ConditionalPriorDict.rescale} groups the parameters of a joint
+distribution by the string \code{dist.distname}, not by object identity. The
+base class sets \code{distname = "joint\_dist"} for every instance, so the
+\code{mass\_1}/\code{lambda\_1} and \code{mass\_2}/\code{lambda\_2} pairs would
+be merged and their results mixed up. \code{TOVJointDist.\_\_init\_\_} now sets
+\code{distname = "tov\_joint\_" + "\_".join(names)}, which is unique per pair.
+\code{TOVMassLambdaTildeJointDist} does the same, with prefix
+\code{"tov\_mc\_q\_lambda\_tilde\_"}.
+\end{bugnote}
+
+%======================================================================
+\section{Binary: \code{TOVMassLambdaTildeJointDist}}
+\label{sec:binary}
+%======================================================================
+
+BNS runs are usually parametrised by $(\Mc, q, \lt, \dlt)$, not by the
+component values. Giving $\lt$ and $\dlt$ independent uniform priors throws
+away the EOS correlation. This class builds the prior on
+$(\Mc, q, \lt, \dlt)$ induced by the same grid. The construction is exact: both
+maps involved are invertible, so the density follows by change of variables,
+with no approximation beyond the grid itself.
+
+\subsection{Construction}
+
+\code{TOVMassLambdaTildeJointDist.\_\_init\_\_} takes the same \code{grid\_file}
+and builds a private \code{TOVJointDist(grid\_file, names=["mass", "lambda"])}
+as \code{self.\_grid}. Every grid operation below goes through that object's
+methods of Section~\ref{sec:tables}, so the two classes share one
+implementation of the tables and of Eq.~\eqref{eq:log10jac}. The internal names
+never reach the sampler. The default parameter \code{names} are
+\code{["chirp\_mass", "mass\_ratio", "lambda\_tilde", "delta\_lambda\_tilde"]},
+in that order; custom names must keep that order.
+
+\subsection{The model in component space}
+
+Write $\theta = (m_1, m_2, \Lambda_1, \Lambda_2)$. The two stars are
+independent draws from the same EOS population, conditioned on the labelling
+convention $m_1 \ge m_2$:
+\begin{equation}
+  p(\theta) \;=\; 2\, p(m_1, \Lambda_1)\, p(m_2, \Lambda_2)\,
+  \mathbb{1}[m_1 \ge m_2].
+  \label{eq:component}
+\end{equation}
+The factor of $2$ is the usual ordering factor: restricting an exchangeable pair
+to the half-space $m_1 \ge m_2$ doubles the density there.
+
+This is a modelling choice worth stating plainly. It treats the two stars as
+independent samples from the \emph{population} of EOS-drawn stars, not as two
+stars sharing one EOS. A common-EOS prior would correlate $\Lambda_1$ and
+$\Lambda_2$ beyond what their masses already imply; Eq.~\eqref{eq:component}
+does not.
+
+\subsection{The map to sampling parameters}
+
+Let $x = (\Mc, q, \lt, \dlt)$ with
+\begin{equation}
+  \Mc = \frac{(m_1 m_2)^{3/5}}{(m_1+m_2)^{1/5}},
+  \qquad
+  q = \frac{m_2}{m_1} \in (0, 1],
+  \qquad
+  \eta = \frac{m_1 m_2}{(m_1+m_2)^2} = \frac{q}{(1+q)^2}.
+\end{equation}
+The tidal combinations are those of Wade et al.\
+(\href{https://arxiv.org/abs/1402.5156}{arXiv:1402.5156}), as implemented in
+\code{bilby.gw.conversion.lambda\_1\_lambda\_2\_to\_lambda\_tilde} and
+\code{lambda\_1\_lambda\_2\_to\_delta\_lambda\_tilde}:
+\begin{align}
+  \lt  &= \tfrac{8}{13}\Big[ c_1 (\Lambda_1 + \Lambda_2) + c_2 (\Lambda_1 - \Lambda_2) \Big], \\
+  \dlt &= \tfrac{1}{2}\Big[ c_3 (\Lambda_1 + \Lambda_2) + c_4 (\Lambda_1 - \Lambda_2) \Big],
+\end{align}
+with $\eta$-dependent coefficients, returned by
+\code{\_lambda\_tilde\_coefficients(eta)}:
+\begin{align}
+  c_1 &= 1 + 7\eta - 31\eta^2, &
+  c_2 &= \sqrt{1-4\eta}\,\big(1 + 9\eta - 11\eta^2\big), \nonumber\\
+  c_3 &= \sqrt{1-4\eta}\,\Big(1 - \tfrac{13272}{1319}\eta + \tfrac{8944}{1319}\eta^2\Big), &
+  c_4 &= 1 - \tfrac{15910}{1319}\eta + \tfrac{32850}{1319}\eta^2 + \tfrac{3380}{1319}\eta^3 .
+  \label{eq:coeffs}
+\end{align}
+The code clips $1-4\eta$ at zero before the square root, so round-off at
+$q = 1$ cannot produce a NaN.
+
+\subsection{The Jacobian factorises}
+
+The map $\theta \mapsto x$ has the block structure
+\begin{equation}
+  \frac{\partial(\Mc, q, \lt, \dlt)}{\partial(m_1, m_2, \Lambda_1, \Lambda_2)}
+  =
+  \begin{pmatrix}
+    \dfrac{\partial(\Mc, q)}{\partial(m_1, m_2)} & \mathbf{0} \\[2ex]
+    \dfrac{\partial(\lt, \dlt)}{\partial(m_1, m_2)} &
+    \dfrac{\partial(\lt, \dlt)}{\partial(\Lambda_1, \Lambda_2)}
+  \end{pmatrix},
+\end{equation}
+because the masses do not depend on the tidal parameters. The upper-right block
+vanishes, so the matrix is block triangular and its determinant is the product
+of the two diagonal blocks. The lower-left block, which is nonzero and depends
+on $\eta$, drops out entirely.
+
+\subsubsection{Mass block}
+
+With $m_1 = \Mc (1+q)^{1/5} q^{-3/5}$ and $m_2 = q m_1$,
+\begin{equation}
+  \frac{\partial m_1}{\partial \Mc} = \frac{m_1}{\Mc},
+  \qquad
+  \frac{\partial m_2}{\partial \Mc} = \frac{m_2}{\Mc} = \frac{q m_1}{\Mc},
+  \qquad
+  \frac{\partial m_2}{\partial q} = m_1 + q \frac{\partial m_1}{\partial q},
+\end{equation}
+so
+\begin{equation}
+  \det \frac{\partial(m_1, m_2)}{\partial(\Mc, q)}
+  = \frac{m_1}{\Mc}\left( m_1 + q \frac{\partial m_1}{\partial q} \right)
+    - \frac{\partial m_1}{\partial q}\, \frac{q m_1}{\Mc}
+  = \frac{m_1^2}{\Mc}.
+  \label{eq:massjac}
+\end{equation}
+The $\partial m_1/\partial q$ terms cancel, leaving the same $m_1^2/\Mc$ that
+appears in \code{bilby.gw.prior.convert\_to\_flat\_in\_component\_mass\_prior}.
+
+\subsubsection{Tidal block}
+
+At fixed masses the tidal map is \emph{linear}:
+\begin{equation}
+  \begin{pmatrix} \lt \\ \dlt \end{pmatrix}
+  = A(\eta)
+  \begin{pmatrix} \Lambda_1 \\ \Lambda_2 \end{pmatrix},
+  \qquad
+  A(\eta) =
+  \begin{pmatrix}
+    \tfrac{8}{13}(c_1 + c_2) & \tfrac{8}{13}(c_1 - c_2) \\[1ex]
+    \tfrac{1}{2}(c_3 + c_4)  & \tfrac{1}{2}(c_3 - c_4)
+  \end{pmatrix}.
+\end{equation}
+Hence
+\begin{align}
+  \det A
+  &= \tfrac{8}{13}\cdot\tfrac{1}{2}\Big[ (c_1+c_2)(c_3-c_4) - (c_1-c_2)(c_3+c_4) \Big] \nonumber \\
+  &= \tfrac{4}{13}\Big[ -2 c_1 c_4 + 2 c_2 c_3 \Big]
+   = \frac{8}{13}\big( c_2 c_3 - c_1 c_4 \big),
+  \label{eq:tidaljac}
+\end{align}
+a function of $\eta$ alone, computed in log form by
+\code{\_ln\_abs\_det\_lambda\_tilde\_jacobian(eta)}. At equal masses
+$\eta \to 1/4$ and $\sqrt{1-4\eta} \to 0$, so $c_2, c_3 \to 0$ and
+$\det A \to -\tfrac{8}{13} c_1 c_4 \neq 0$. The map stays invertible on the whole
+physical range, and no special case is needed at $q = 1$.
+
+\subsection{The density}
+\label{sec:binary_density}
+
+Combining Eqs.~\eqref{eq:component}, \eqref{eq:massjac} and \eqref{eq:tidaljac},
+\begin{equation}
+  \boxed{\;
+  p(\Mc, q, \lt, \dlt)
+  = 2\, p(m_1, \Lambda_1)\, p(m_2, \Lambda_2)\,
+    \frac{m_1^2}{\Mc}\, \frac{1}{\lvert \det A(\eta) \rvert}
+  \;}
+\end{equation}
+or, term by term as \code{TOVMassLambdaTildeJointDist.\_ln\_prob} evaluates it,
+\begin{align}
+  \ln p(\Mc, q, \lt, \dlt) =\;&
+    \ln 2
+    + \ln p(m_1, \Lambda_1) + \ln p(m_2, \Lambda_2) \nonumber \\
+    &+ 2\ln m_1 - \ln \Mc
+    - \ln\big\lvert \det A(\eta) \big\rvert .
+  \label{eq:binary_lnprob}
+\end{align}
+The component values are recovered from $x$ with the standard inversions,
+\code{chirp\_mass\_and\_mass\_ratio\_to\_total\_mass},
+\code{total\_mass\_and\_mass\_ratio\_to\_component\_masses} and
+\code{lambda\_tilde\_delta\_lambda\_tilde\_to\_lambda\_1\_lambda\_2} (all in
+\code{bilby.gw.conversion}). Each $\ln p(m_k, \Lambda_k)$ comes from
+\code{self.\_grid.ln\_pdf\_mass\_lambda}, so it already includes the corrected
+Jacobian of Eq.~\eqref{eq:log10jac}. The bug of Section~\ref{sec:log10jac}
+entered this formula twice, once per star.
+
+\subsection{Support and bounds}
+\label{sec:support}
+
+The prior is \emph{not} supported on a box in $x$. A rectangle in
+$(\lt, \dlt)$ contains points whose implied $\Lambda_1$ or $\Lambda_2$ is
+negative, and points that fall outside the EOS grid entirely.
+\code{\_ln\_prob} builds a \code{valid} mask that requires $q \in (0, 1]$,
+$\Mc > 0$, $\Lambda_1, \Lambda_2 > 0$, and finite recovered components. At
+invalid points it substitutes harmless in-grid values before calling the
+interpolant, which keeps NaNs out of it, and then sets those points to
+$-\infty$. Points that are valid but off the grid get $-\infty$ from the
+interpolant's \code{fill\_value}.
+
+\code{TOVMassLambdaTildeJointDist.default\_bounds()} returns \emph{outer}
+bounds on this non-rectangular support; being inside them does not imply
+finite probability. They are derived as follows.
+\begin{itemize}
+  \item $\Mc$ increases in both masses, so it is bracketed by
+    $\Mc(m_{\min}, m_{\min})$ and $\Mc(m_{\max}, m_{\max})$.
+  \item $q \in [m_{\min}/m_{\max},\, 1]$.
+  \item At fixed masses, $\lt$ and $\dlt$ are linear in $(\Lambda_1, \Lambda_2)$,
+    so their extrema over the grid's $\Lambda$ range lie at the four corners
+    $\Lambda_k \in \{10^{\ell_{\min}}, 10^{\ell_{\max}}\}$. These are scanned
+    over a $200 \times 200$ grid of ordered masses $m_1 \ge m_2$.
+\end{itemize}
+The tidal bounds come from a scan, not a proof. Empirically, none of
+$4\times10^5$ draws from \code{rescale} fell outside them.
+
+\begin{caveat}{exact unit-cube edges}
+At $u_k \in \{0, 1\}$ exactly, \code{rescale} returns a point on the grid
+boundary. The round trip through the inversions above can then land
+$\sim10^{-16}$ outside it, e.g.\ $m_1 = m_{\min} - 1.1\times10^{-16}$, and
+\code{ln\_prob} returns $-\infty$. Continuous uniform draws essentially never hit
+these values; the interior of the cube is unaffected.
+\end{caveat}
+
+\subsection{Prior transform}
+\label{sec:binary_rescale}
+
+\code{TOVMassLambdaTildeJointDist.\_component\_rescale} maps
+$u \in [0,1]^4$ to $\theta$, and \code{\_rescale} then applies
+$\theta \mapsto x$ with \code{component\_masses\_to\_chirp\_mass},
+$q = m_2/m_1$ and the two tidal conversions.
+
+The ordering $m_1 \ge m_2$ is imposed by the transform itself, not by rejection,
+which keeps the map a smooth bijection. If $m_1$ is the larger of two
+independent draws from $p(m)$, its CDF is $F(m)^2$, so
+\begin{equation}
+  m_1 = F^{-1}\!\left( \sqrt{u_0} \right),
+  \qquad
+  m_2 = F^{-1}\!\big( u_1\, F(m_1) \big),
+  \label{eq:ordered}
+\end{equation}
+the second being $p(m)$ truncated to $[m_{\min}, m_1]$. In code, these are
+\code{\_grid.mass\_from\_cdf(np.sqrt(u0))} and
+\code{\_grid.mass\_from\_cdf(u1 * \_grid.mass\_cdf(m1))}. The induced density is
+\begin{equation}
+  \underbrace{2\, p(m_1) F(m_1)}_{\text{max of two draws}} \times
+  \underbrace{\frac{p(m_2)}{F(m_1)}}_{\text{truncated}}
+  = 2\, p(m_1)\, p(m_2),
+\end{equation}
+exactly the mass part of Eq.~\eqref{eq:component}; the $F(m_1)$ factors cancel.
+They also cancel for the discretised $F$ the code actually uses, so the
+ordering adds no discretisation error beyond that of
+Section~\ref{sec:discretisation}. The deformabilities then follow
+star by star from Eq.~\eqref{eq:single_rescale},
+\begin{equation}
+  \Lambda_1 = 10^{\,G^{-1}(u_2 \mid m_1)},
+  \qquad
+  \Lambda_2 = 10^{\,G^{-1}(u_3 \mid m_2)},
+\end{equation}
+via \code{\_grid.log10\_lambda\_from\_cdf}.
+
+Which cube coordinate feeds which physical parameter is arbitrary.
+\code{rescale} maps the whole vector at once, so the sampler never relies on a
+per-coordinate correspondence. As with the single-star class, \code{\_sample}
+is \code{\_rescale} applied to uniform draws.
+
+%======================================================================
+\section{Conditional deformability: \code{TOVConditionalLambdaPrior}}
+\label{sec:conditional}
+%======================================================================
+
+Both joint classes also fix the mass prior, to the EOS population's mass
+distribution. A run often has its own mass prior, e.g.\ uniform in component
+masses, and wants the EOS only to shape $\Lambda$ given that mass.
+\code{TOVConditionalLambdaPrior} does this.
+
+\subsection{Model}
+
+With any mass prior $\pi(m_1, m_2)$ chosen by the user, the prior is
+\begin{equation}
+  p(m_1, m_2, \Lambda_1, \Lambda_2)
+  = \pi(m_1, m_2)\; p(\Lambda_1 \mid m_1)\; p(\Lambda_2 \mid m_2),
+  \qquad
+  p(\Lambda \mid m) = \frac{p_{\mathrm{TOV}}(m, \Lambda)}{p_{\mathrm{TOV}}(m)} .
+  \label{eq:conditional}
+\end{equation}
+One instance is created per star (\code{component=1} or \code{2}, default name
+\code{lambda\_<component>}). Each depends only on its own star's mass, so, as in
+Eq.~\eqref{eq:component}, the two deformabilities are independent given the
+masses. Because the masses are conditioned on rather than transformed, no mass
+Jacobian enters. The prior on the masses is exactly $\pi$, and $\Lambda$ is
+correlated with the mass the run actually samples.
+
+\subsection{The conditional density, exactly normalised}
+
+The joint density $p_{\mathrm{TOV}}(m, \Lambda)$ is the one every other class
+uses, \code{TOVJointDist.ln\_pdf\_mass\_lambda} (Eq.~\ref{eq:single}). Its
+normaliser $p_{\mathrm{TOV}}(m) = \int p_{\mathrm{TOV}}(m, \Lambda)\,\dd\Lambda$
+is computed from the same interpolant, not from the trapezoid table of
+Eq.~\eqref{eq:massmarg}, so that each conditional integrates to exactly one.
+
+The interpolant is bilinear in $\ln p$. At fixed mass $m$ in the cell
+$[m_i, m_{i+1}]$, it is therefore piecewise \emph{linear} in $\ell$, with node
+values blended linearly in mass:
+\begin{equation}
+  \ln p_{\mathrm{TOV}}(m, \ell) = a_j + d_j\, t,
+  \qquad
+  a_j = (1-w)\,\code{log\_pdf}[i, j] + w\,\code{log\_pdf}[i+1, j],
+  \qquad
+  d_j = a_{j+1} - a_j,
+  \label{eq:rowlinear}
+\end{equation}
+for $\ell = \ell_j + t\,h_j$ with $t \in [0, 1]$, cell width
+$h_j = \ell_{j+1} - \ell_j$, and $w$ as in Eq.~\eqref{eq:rowblend}. The density
+is piecewise exponential, so each cell integrates in closed form:
+\begin{equation}
+  I_j = \int_{\ell_j}^{\ell_{j+1}} p_{\mathrm{TOV}}(m, \ell)\,\dd\ell
+      = h_j\,\frac{e^{a_{j+1}} - e^{a_j}}{d_j}
+  \quad\big(\to h_j\, e^{a_j} \text{ as } d_j \to 0\big),
+  \qquad
+  p_{\mathrm{TOV}}(m) = \sum_j I_j .
+  \label{eq:cellint}
+\end{equation}
+Then $\int p_{\mathrm{TOV}}(m,\Lambda)\,\dd\Lambda = \int p_{\mathrm{TOV}}(m,\ell)\,\dd\ell$,
+because the $\ell \to \Lambda$ Jacobian of Eq.~\eqref{eq:log10jac} cancels.
+\code{ln\_prob} returns
+\begin{equation}
+  \ln p(\Lambda \mid m) = \ln p_{\mathrm{TOV}}(m, \Lambda) - \ln \sum_j I_j(m) .
+\end{equation}
+Numerically, each row is shifted by its maximum before exponentiating. The
+grid's log-density spans $[-690.8, 0.33]$, with jumps of up to $685$ between
+neighbouring cells, so the unshifted form would overflow or underflow.
+\code{TOVConditionalLambdaPrior.\_conditional\_tables} computes the shifted
+$a_j$, the cumulative sums $C_j = \sum_{k<j} I_k$, and $\ln p_{\mathrm{TOV}}(m)$,
+vectorised over masses.
+
+\subsection{Prior transform and CDF}
+
+The same closed form gives the CDF and its inverse, with no separate tables.
+For $\ell$ in cell $j$ at fraction $t$,
+\begin{equation}
+  G(\ell \mid m) = \frac{C_j + h_j\,\big(e^{a_j + d_j t} - e^{a_j}\big)/d_j}{\sum_k I_k},
+  \label{eq:condcdf_exact}
+\end{equation}
+implemented by \code{TOVConditionalLambdaPrior.cdf}. For \code{rescale}, the
+target $r = u \sum_k I_k$ selects the cell with $C_j \le r < C_{j+1}$. The
+remainder $\rho = r - C_j$ then gives
+\begin{equation}
+  t = \frac{\ln\!\big(e^{a_j} + \rho\, d_j / h_j\big) - a_j}{d_j}
+  \quad\big(\to \rho / (h_j e^{a_j}) \text{ as } d_j \to 0\big),
+  \qquad
+  \Lambda = 10^{\ell_j + t h_j} .
+  \label{eq:condinv}
+\end{equation}
+The argument of the logarithm is evaluated directly, without dividing by
+$e^{a_j}$, so cells at the KDE floor are handled without overflow. Cells of
+zero width in probability are never selected.
+
+\paragraph{Consequence.}
+Unlike the joint classes (Section~\ref{sec:discretisation}), \code{rescale} and
+\code{ln\_prob} here describe \emph{the same} density, not two
+discretisations of it. The verification in Section~\ref{sec:verify_conditional}
+confirms this to rounding error.
+
+\subsection{Which parameters it conditions on}
+
+\code{mass\_parameters} selects the required variables, i.e.\ the keys
+\code{ConditionalPriorDict} must supply:
+\begin{itemize}
+  \item \code{"component\_masses"} (default): \code{mass\_<component>}, for runs
+    that sample the component masses directly.
+  \item \code{"chirp\_mass\_and\_mass\_ratio"}: \code{chirp\_mass} and
+    \code{mass\_ratio}, converted internally with
+    \code{chirp\_mass\_and\_mass\_ratio\_to\_total\_mass} and
+    \code{total\_mass\_and\_mass\_ratio\_to\_component\_masses}. This mode is
+    for runs such as \code{prior\_files/aligned\_spins\_bns.prior}, which
+    sample $(\Mc, q)$ and hold \code{mass\_1}, \code{mass\_2} as
+    \code{Constraint}s. A constraint is not a sampled parameter, so it cannot
+    be conditioned on, and \code{ConditionalPriorDict} would report the
+    conditions as unresolvable. As the conditioning is on a deterministic
+    function of $(\Mc, q)$, no Jacobian is needed here either.
+\end{itemize}
+For a given mass, both modes return the same density.
+
+\subsection{Masses outside the grid}
+
+$p(\Lambda \mid m)$ is defined only for $m \in [1.000, 3.476]\,M_\odot$.
+Outside that range, \code{ln\_prob} returns $-\infty$, and \code{rescale}
+returns \code{nan} with a one-off warning. It does not raise, because bilby
+rescales every key before checking constraints, and an out-of-grid draw that a
+\code{Constraint} is about to reject must not abort the run. The mass prior
+should therefore lie inside the grid. In
+\code{"chirp\_mass\_and\_mass\_ratio"} mode, the component masses implied by a
+$(\Mc, q)$ box generally reach beyond it. The \code{mass\_1} and \code{mass\_2}
+constraints must then be tightened to the grid, e.g.\ to $[1.0, 3.47]$,
+instead of the $[0.5, 5]$ in \code{aligned\_spins\_bns.prior}.
+
+\subsection{Implementation notes}
+
+\begin{itemize}
+  \item The class follows the idiom of \code{ConditionalChiInPlane} in the same
+    file. It subclasses \code{ConditionalBasePrior}, sets
+    \code{\_required\_variables} explicitly, passes a no-op
+    \code{\_condition\_function}, and overrides \code{rescale},
+    \code{ln\_prob}, \code{prob} and \code{cdf}. \code{sample} is inherited
+    and calls \code{rescale} on uniform draws. Calls with the wrong required
+    variables raise \code{IllegalRequiredVariablesException}. A call with none,
+    i.e.\ outside a \code{ConditionalPriorDict}, raises a \code{ValueError}
+    saying so.
+  \item \code{conditional\_prior\_factory} renames the class on instantiation.
+    The constructor restores the name, and \code{\_\_repr\_\_} and
+    \code{get\_instantiation\_dict} use the \code{Prior} versions, so the prior
+    round-trips through prior files and result JSON. \code{grid\_file} is stored
+    as given; use an absolute path if results will be reloaded elsewhere.
+  \item \code{grid\_file} may also be an existing \code{TOVJointDist}, whose
+    loaded grid is then shared. \code{TOVJointDist.\_\_init\_\_} keeps the raw
+    table as \code{\_log\_pdf} for this class.
+  \item Scalar inputs return NumPy scalars, not 0-d arrays, for the LAL
+    \code{REAL8} reason given in Section~\ref{sec:machinery}.
+\end{itemize}
+
+%======================================================================
+\section{Integration with bilby's joint-prior machinery}
+\label{sec:machinery}
+%======================================================================
+
+\subsection{How a sampler reaches the classes}
+
+Each parameter has its own \code{Prior} object (\code{TOVJointPrior} or
+\code{TOVMassLambdaTildeJointPrior}), all sharing one \code{Dist}. Their
+constructors only add a type check on \code{dist} to
+\code{JointPrior.\_\_init\_\_}. The shared \code{Dist} holds per-call state,
+and the inherited \code{JointPrior} methods use it as follows.
+\begin{itemize}
+  \item \code{rescale(val)} stores \code{val} in \code{dist.rescale\_parameters}
+    and returns \code{[]} until every parameter of the dist has been
+    supplied. It then stacks the stored values \emph{in \code{dist.names}
+    order}, calls \code{dist.rescale}, and resets the store. The order in
+    which a sampler lists its search keys therefore does not matter.
+    \code{ConditionalPriorDict.rescale} then copies the full vector back to
+    each parameter, grouping by \code{distname} (Section~\ref{sec:pairs}).
+  \item \code{ln\_prob(val)} works the same way through
+    \code{dist.requested\_parameters}. Every parameter but the last returns $0$,
+    and the last returns the joint log-density, so the sum
+    \code{PriorDict.ln\_prob} forms is correct.
+  \item \code{sample()} draws all parameters of the dist at once on the first
+    call and hands out the stored values on later calls, so the parameters of
+    one draw belong to the same $(m, \Lambda)$ or $\theta$.
+\end{itemize}
+Nested samplers (\code{dynesty} and others) use only \code{rescale}; MCMC samplers
+(\code{emcee}, \code{bilby\_mcmc}) use only \code{ln\_prob}. Both feed the
+\code{log\_prior} column of the result, which \code{Result} computes as
+\code{priors.ln\_prob(dict(posterior), axis=0)}, i.e.\ vectorised over samples.
+
+\paragraph{The conditional prior takes a different route.}
+\code{TOVConditionalLambdaPrior} holds no shared state and goes through
+\code{ConditionalPriorDict}'s conditional path. The dict recognises it by its
+\code{condition\_func} attribute and orders it after the keys listed in
+\code{required\_variables}. It then passes their most recently sampled values
+(\code{least\_recently\_sampled}) as keyword arguments to \code{rescale},
+\code{ln\_prob} and \code{sample}. For vectorised \code{ln\_prob}, these are
+arrays, and the class broadcasts them against the $\Lambda$ values.
+
+\subsection{Fixes to the interface}
+
+Four interface bugs made the original classes fail inside real runs. All are
+fixed in the subclasses, leaving \code{bilby/core/prior/joint.py} untouched so
+that the fork stays a clean addition on top of upstream. Each fix is harmless if
+upstream changes later.
+
+\begin{bugnote}{\code{xp} keyword}
+Upstream \code{BaseJointPriorDist.ln\_prob} now passes an array-namespace
+argument \code{xp} to \code{\_ln\_prob}. Both \code{\_ln\_prob} implementations
+are decorated with \code{@xp\_wrap} and accept \code{xp}. They compute in NumPy,
+because \code{RegularGridInterpolator} is NumPy-only, and convert back with
+\code{xp.asarray}. The classes are therefore NumPy-bound: an \code{xp} of CuPy
+or JAX fails in \code{\_ln\_prob}.
+\end{bugnote}
+
+\begin{bugnote}{\code{random\_state} ignored}
+\code{\_sample} drew from NumPy's global generator, so seeded runs did not
+reproduce and pool workers could share a stream. Both \code{\_sample}
+methods now resolve the generator with
+\code{bilby.core.utils.random.resolve\_random\_state(random\_state)}.
+\end{bugnote}
+
+\begin{bugnote}{0-d arrays from \code{sample()}}
+\code{JointPrior.sample} ends in \code{sample.squeeze()}, which for a size-1
+draw returns a 0-d \code{ndarray}, not a float. LAL's SWIG \code{REAL8} typemap
+rejects it:
+\begin{center}
+\small\code{TypeError: in method}\\\code{'SimInspiralWaveformParamsInsertTidalLambda1',}\\\code{argument 2 of type 'REAL8'}
+\end{center}
+The masses escaped only because they are multiplied by \code{lal.MSUN\_SI}
+before reaching LAL, which turns them into scalars. \code{TOVJointPrior.sample}
+and \code{TOVMassLambdaTildeJointPrior.sample} append \code{[()]}, which unwraps
+0-d arrays and leaves larger results unchanged.
+\end{bugnote}
+
+\begin{bugnote}{shape-$(1,)$ arrays from \code{ln\_prob}}
+\code{BaseJointPriorDist.ln\_prob} returns shape $(1,)$ for a single sample,
+while ordinary priors return floats. \code{PriorDict.ln\_prob} then fails while
+stacking the per-parameter terms:
+\begin{center}
+\code{ValueError: setting an array element with a sequence. ...}
+\end{center}
+\code{TOVJointDist.ln\_prob} and \code{TOVMassLambdaTildeJointDist.ln\_prob}
+override it to return a scalar in that case, matching what
+\code{BaseJointPriorDist.rescale} already does.
+\end{bugnote}
+
+\subsection{Bounds}
+
+\begin{caveat}{tightened bounds are honoured by \code{ln\_prob} only}
+Setting a narrower range on one parameter, e.g.\
+\code{priors["lambda\_tilde"].maximum = 600}, updates \code{dist.bounds}.
+\code{BaseJointPriorDist.\_check\_samp} then sets \code{ln\_prob} to $-\infty$
+outside the range, but \code{BaseJointPriorDist.rescale} applies no bounds. In
+that example, $26\%$ of \code{rescale} draws still have $\lt > 600$, so a nested
+sampler and an MCMC sampler would explore different priors. The truncated
+density is also no longer normalised.
+
+There is a second, upstream problem in \code{\_check\_samp}: for a batch of
+samples, it keeps the out-of-bounds mask of the \emph{first} parameter that has
+any violation and does not combine masks across parameters. With bounds
+tightened on two parameters, the vectorised \code{ln\_prob} used for
+\code{log\_prior} let 349 of 532 violating points through with finite
+probability. Evaluated one sample at a time, all of them correctly get
+$-\infty$.
+
+Neither problem arises with the default bounds, where the support check in
+\code{\_ln\_prob} does the real work. To restrict the range, leave the bounds
+alone and add a \code{bilby.core.prior.Constraint} instead. Constraints are
+applied consistently and renormalised by \code{PriorDict}.
+\end{caveat}
+
+%======================================================================
+\section{Verification}
+\label{sec:verify}
+%======================================================================
+
+\subsection{\code{verify\_tov\_joint\_priors.py}}
+
+The script at the repository root runs four groups of checks on the
+\code{Dist} classes directly:
+\begin{verbatim}
+    python verify_tov_joint_priors.py [path/to/tov_mass_lambda_joint_kde_grid.npz]
+\end{verbatim}
+
+\paragraph{1. Jacobians against finite differences.}
+At four configurations, including near-equal masses where
+$\sqrt{1-4\eta} \to 0$, the full $4\times4$ determinant of $\theta \mapsto x$ is
+compared with the analytic $m_1^2/\Mc \cdot \lvert\det A\rvert^{-1}$. They agree
+to better than $10^{-6}$ in the log, which also confirms the block-triangularity
+argument.
+
+\paragraph{2. Ordering and invertibility.}
+For $2\times10^4$ draws from \code{\_component\_rescale}, $m_1 \ge m_2$ and
+$q \in (0, 1]$ always hold. Pushing the draws back through the inversions of
+\code{\_ln\_prob} recovers $\theta$ to a relative error of $1.5\times10^{-11}$,
+and \code{ln\_prob} is finite on all of them.
+
+\paragraph{3. \code{ln\_prob} is the density \code{rescale} samples from.}
+This is the check that caught the bug of Section~\ref{sec:log10jac}. For
+samples $x_i \sim p$ and any box $B$,
+\begin{equation}
+  \frac{1}{N} \sum_{x_i \in B} \frac{1}{\mathrm{vol}(B)\, p(x_i)}
+  \;\xrightarrow{\;N \to \infty\;}\;
+  \int_B \frac{p(x)}{\mathrm{vol}(B)\, p(x)}\,\dd x \;=\; 1 .
+\end{equation}
+This unbiased estimator of $1$ does not depend on how sharply $p$ varies inside
+$B$. A raw histogram comparison does, and for this strongly correlated density
+it is off by more than an order of magnitude at feasible sample sizes. Any
+missing constant, Jacobian or normalisation shows up directly as a departure
+from $1$.
+
+\paragraph{4. Control.}
+The same estimator applied to the two-parameter \code{TOVJointDist}.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrr}
+\toprule
+Box centre & before fix & current code \\
+\midrule
+\multicolumn{3}{l}{\code{TOVMassLambdaTildeJointDist}, $(\Mc,\, q,\, \lt,\, \dlt)$} \\
+$(1.20,\ 0.85,\ 400,\ -30)$ & $17.9 \pm 1.2$ & $1.02 \pm 0.07$ \\
+$(1.35,\ 0.75,\ 250,\ -40)$ & $19.0 \pm 3.1$ & $0.96 \pm 0.08$ \\
+$(1.15,\ 0.90,\ 600,\ -20)$ & $18.8 \pm 1.2$ & $1.06 \pm 0.07$ \\
+\midrule
+\multicolumn{3}{l}{control: \code{TOVJointDist}, $(m, \Lambda)$} \\
+$(1.30,\ 400)$ & --- & $1.02 \pm 0.02$ \\
+$(1.80,\ 100)$ & --- & $1.00 \pm 0.01$ \\
+\bottomrule
+\end{tabular}
+\caption{Box estimator, target $1$, with $N = 4\times10^5$ samples. The
+``before fix'' column was recorded when the bug was found. The constant
+$18.8$ is $(10/\ln 10)^2$, the same error once per star.}
+\end{table}
+
+The box estimator only probes the bulk of the distribution. The global
+comparison of Section~\ref{sec:discretisation}, done by importance-weighting
+draws with the exact density of Eq.~\eqref{eq:rescale_density}, extends the
+agreement to the whole support, tails included.
+
+\subsection{Checks through bilby's sampling interface}
+
+The script calls the \code{Dist} classes directly. The following was also
+checked through \code{BNSPriorDict} and \code{bilby.run\_sampler}, exactly as a
+run calls the classes.
+\begin{itemize}
+  \item \code{ConditionalPriorDict.rescale} reproduces \code{dist.rescale} for
+    any ordering of the search keys, with fixed and ordinary priors mixed in,
+    and leaves no state behind. \code{PriorDict.ln\_prob} returns a scalar for
+    single samples and the correct array for the vectorised
+    \code{log\_prior} computation. Single draws are scalars, and the four
+    values of one draw are coherent.
+  \item \textbf{dynesty}, four-parameter prior with a Gaussian likelihood on
+    $(\Mc, \lt)$: $\ln Z = -1.579 \pm 0.043$ against a Monte Carlo value of
+    $-1.562$. All 5/50/95\% posterior quantiles of the four parameters match
+    the importance-reweighted prior, and the \code{log\_prior} column equals
+    \code{dist.ln\_prob}. The same holds with \code{npool=2}
+    ($\ln Z = -1.583 \pm 0.059$), which confirms the classes pickle and work
+    in spawned workers.
+  \item \textbf{dynesty}, two \code{TOVJointDist} pairs:
+    $\ln Z = -1.743 \pm 0.063$ against $-1.734$, with quantiles in agreement.
+  \item \textbf{emcee} with a flat likelihood reproduces the prior's $\Mc$ and
+    $q$ to $2\%$ of the 90\% width. It shows tails in $\lt$ and $\dlt$ that are
+    $2$--$8\%$ heavy, which is slow mixing of the stretch move in long,
+    correlated tails: Section~\ref{sec:discretisation} bounds any genuine
+    \code{ln\_prob}/\code{rescale} difference at $0.3\%$. MCMC runs dominated by
+    the prior need long, thinned chains.
+\end{itemize}
+\subsection{\code{TOVConditionalLambdaPrior}}
+\label{sec:verify_conditional}
+
+\paragraph{Exactness.}
+\begin{itemize}
+  \item $\int \exp(\code{ln\_prob})\,\dd\Lambda = 1$ to $4.5\times10^{-8}$ at eight
+    masses, including both grid edges. The residual comes from the fine
+    numerical quadrature used to check it.
+  \item $\lvert \code{cdf}(\code{rescale}(u)) - u \rvert < 1.3\times10^{-12}$
+    over $2\times10^5$ random $(u, m)$.
+  \item \code{cdf} agrees with a direct numerical integral of
+    $\exp(\code{ln\_prob})$ to $3\times10^{-8}$. Together with the previous
+    item, this shows \code{rescale} samples exactly the density \code{ln\_prob}
+    returns. KS tests of \code{rescale} draws against \code{cdf} at three masses
+    give $p = 0.43$--$0.81$.
+  \item $\ln p_{\mathrm{joint}}(m, \Lambda) - \ln p(\Lambda \mid m)$, using
+    \code{TOVJointDist.ln\_prob} for the joint, is constant in $\Lambda$ to
+    $4\times10^{-14}$. The conditional is therefore the joint renormalised, as
+    Eq.~\eqref{eq:conditional} states.
+\end{itemize}
+
+\paragraph{Through \code{BNSPriorDict}.}
+\begin{itemize}
+  \item The $\Lambda$ keys resolve as conditional.
+  \item \code{rescale} and \code{ln\_prob} match direct calls for any key order.
+  \item \code{ln\_prob} is a scalar for single samples and correct when
+    vectorised.
+  \item Single draws are NumPy scalars.
+  \item \code{mass\_1} keeps its own \code{Uniform} prior (KS), while
+    $\mathrm{corr}(m_1, \ln\Lambda_1) = -0.89$, so $\Lambda$ follows the run's
+    mass.
+  \item The \code{"chirp\_mass\_and\_mass\_ratio"} mode gives the same density
+    as the component mode at the implied mass.
+  \item Off-grid masses give \code{nan} with a warning (\code{rescale}) and
+    $-\infty$ (\code{ln\_prob}).
+  \item Wrong or missing required variables raise.
+  \item The prior survives repr, a prior-file round trip and a JSON round trip.
+\end{itemize}
+
+\paragraph{Samplers.}
+With uniform component masses on $[1, 2]$ and a Gaussian likelihood on
+$(\Lambda_1, \Lambda_2)$:
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+mass parameters & dynesty $\ln Z$ & Monte Carlo $\ln Z$ \\
+\midrule
+\code{component\_masses} & $-1.014 \pm 0.034$ & $-1.003$ \\
+\code{chirp\_mass\_and\_mass\_ratio} & $-1.166 \pm 0.035$ & $-1.172$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+In both modes, all 5/50/95\% posterior quantiles of the masses and
+deformabilities match the importance-reweighted prior. The \code{log\_prior}
+column is finite, and the result reloads from JSON with the prior intact.
+\textbf{emcee} with a flat likelihood, which uses only \code{ln\_prob},
+reproduces the prior. With 64 walkers and $3\times10^4$ steps, the
+5--95\% quantiles deviate by $0.4\%$ of the 90\% width for $m_1$ and $2.4\%$ for
+$\Lambda_1$. A $5\times$ shorter chain gave $5.1\%$ for $\Lambda_1$, with the
+upper tail on the other side of the reference. The residual is mixing in the
+heavy $\Lambda$ tail, not a density error, which the exactness checks above
+rule out.
+
+The fork's \code{requirements.txt} requires \code{dynesty>=3.0.0}, because
+\code{bilby.core.sampler.dynesty\_utils} imports \code{dynesty.internal\_samplers};
+dynesty 2.x fails at import.
+
+%======================================================================
+\section{Usage}
+%======================================================================
+
+\paragraph{Four-parameter prior,} for runs in $(\Mc, q, \lt, \dlt)$:
+\begin{verbatim}
+    from bilby.gw.prior import (
+        BNSPriorDict, TOVMassLambdaTildeJointDist, TOVMassLambdaTildeJointPrior)
+
+    grid = "prob_data/tov_mass_lambda_joint_kde_grid.npz"
+    dist = TOVMassLambdaTildeJointDist(grid)
+    priors = BNSPriorDict()   # then add the remaining BNS parameters
+    for name in dist.names:
+        priors[name] = TOVMassLambdaTildeJointPrior(dist, name)
+\end{verbatim}
+
+\paragraph{Per-star joint prior,} for runs in component masses and deformabilities:
+see Section~\ref{sec:pairs}, and note that it does not order the masses.
+
+\paragraph{Conditional $\Lambda$ with your own mass prior,} sampling component
+masses:
+\begin{verbatim}
+    from bilby.core.prior import Uniform
+    from bilby.gw.prior import BNSPriorDict, TOVConditionalLambdaPrior
+
+    grid = "/abs/path/prob_data/tov_mass_lambda_joint_kde_grid.npz"
+    priors = BNSPriorDict(dictionary=dict(
+        mass_1=Uniform(1.0, 2.0, "mass_1"),
+        mass_2=Uniform(1.0, 2.0, "mass_2"),
+        lambda_1=TOVConditionalLambdaPrior(grid, component=1),
+        lambda_2=TOVConditionalLambdaPrior(grid, component=2),
+    ))  # then add the remaining BNS parameters
+\end{verbatim}
+or, in a prior file that samples $(\Mc, q)$, as \code{aligned\_spins\_bns.prior}
+does:
+\begin{verbatim}
+    mass_1 = Constraint(name='mass_1', minimum=1.0, maximum=3.47)
+    mass_2 = Constraint(name='mass_2', minimum=1.0, maximum=3.47)
+    lambda_1 = bilby.gw.prior.TOVConditionalLambdaPrior(grid_file='/path/grid.npz',
+        component=1, mass_parameters='chirp_mass_and_mass_ratio')
+    lambda_2 = bilby.gw.prior.TOVConditionalLambdaPrior(grid_file='/path/grid.npz',
+        component=2, mass_parameters='chirp_mass_and_mass_ratio')
+\end{verbatim}
+
+\paragraph{In all cases:}
+\begin{itemize}
+  \item for the joint classes, use one \code{Dist} instance per joint group and
+    pass the same object to each of its \code{Prior}s;
+  \item restrict ranges with a \code{Constraint}, not by changing
+    \code{minimum}/\code{maximum} (Section~\ref{sec:machinery});
+  \item keep every mass the EOS is evaluated at inside the grid,
+    $[1.000, 3.476]\,M_\odot$;
+  \item the classes are NumPy-only.
+\end{itemize}
+
+\end{document}

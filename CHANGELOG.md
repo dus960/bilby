@@ -3,6 +3,20 @@
 **Note:** following the migration from LIGO GitLab to GitHub, the links in this changelog have been retroactively updated, see [this PR](https://github.com/bilby-dev/bilby/pull/36).
 The original MRs are only visible on the [LIGO GitLab repository](https://git.ligo.org/lscsoft/bilby/-/merge_requests?scope=all&state=all)
 
+
+## DS Changes
+
+### TOVJointDist/TOVJointPrior
+* BUG: Fixed four bugs in TOVJointDist/TOVJointPrior — accepting bilby's new xp argument, honouring random_state, and returning scalars instead of 0-d arrays from sample() and ln_prob() (the latter two as subclass overrides, leaving upstream joint.py untouched).
+* BUG: Fixed the log10(Lambda) -> Lambda Jacobian in TOVJointDist.ln_prob, which used `log(10)` where it needed `log(log(10))`, leaving the log-density low by a constant `log(10 / ln 10) = 1.469`. Constant, so posteriors were unaffected, but the log evidence was shifted and the density was not normalised.
+* ENH: Refactored the grid machinery of TOVJointDist into reusable methods (`mass_cdf`, `mass_from_cdf`, `log10_lambda_from_cdf`, `ln_pdf_mass_lambda`); `_rescale`/`_ln_prob` now call them and are numerically unchanged.
+
+### TOVMassLambdaTildeJointDist/TOVMassLambdaTildeJointPrior
+* ENH: New joint prior over (chirp_mass, mass_ratio, lambda_tilde, delta_lambda_tilde) built from the same TOV mass-Lambda KDE grid used by TOVJointDist. Draws two (mass, Lambda) pairs from the grid conditioned on mass_1 >= mass_2 and maps them exactly into the sampling parameters, so a run in the tidal-tilde parametrisation carries the EOS mass-Lambda correlation instead of an independent uniform tidal prior. Added `verify_tov_joint_priors.py`, which checks the Jacobians against finite differences and confirms that `ln_prob` is the density `rescale` samples from.
+
+### TOVConditionalLambdaPrior
+* ENH: New conditional prior p(Lambda | mass) on one star's tidal deformability from the same TOV grid, for runs that keep their own mass prior. Conditions on `mass_<component>` or, with `mass_parameters="chirp_mass_and_mass_ratio"`, on `chirp_mass` and `mass_ratio`. The normalisation, CDF and inverse CDF are computed exactly from the `ln_prob` interpolant, so `rescale` samples exactly the density `ln_prob` returns. Masses outside the grid give `nan` (rescale) and `-inf` (ln_prob). TOVJointDist now keeps the raw `log_pdf` table as `_log_pdf` for it.
+
 ## [Unreleased]
 
 ### Changes

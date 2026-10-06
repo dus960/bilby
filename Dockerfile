@@ -6,31 +6,31 @@ LABEL description="Custom bilby environment for OSG"
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
-USER root
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+# setuptools_scm reads the version from here instead of .git
+ARG BILBY_VERSION=0.0.0
+ENV SETUPTOOLS_SCM_PRETEND_VERSION=${BILBY_VERSION}
 
+USER root
 WORKDIR /src
 
-COPY .git /src/.git
 COPY pyproject.toml requirements.txt gw_requirements.txt jax_requirements.txt \
      mcmc_requirements.txt optional_requirements.txt MANIFEST.in README.rst \
      LICENSE.md /src/
 COPY bilby /src/bilby
 COPY cli_bilby /src/cli_bilby
 
-RUN conda install -c conda-forge numpy==2.3.5 scipy ezdag gwpy lalsuite bilby_pipe beartype rich
+# conda's bilby 2.8.1 comes in as a bilby_pipe dependency; drop it so only the
+# fork is installed. conda clean must be in this RUN or the cache persists.
+RUN conda install -y -c conda-forge python=3.13 numpy==2.3.5 scipy ezdag gwpy lalsuite \
+        bilby_pipe==1.10.1 beartype rich \
+ && conda remove --force -y bilby \
+ && conda clean -afy
 
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir --no-deps -r requirements.txt && \
-    pip install --no-cache-dir --no-deps .
+RUN pip install --no-cache-dir --upgrade pip \
+ && pip install --no-cache-dir --no-deps -r requirements.txt \
+ && pip install --no-cache-dir --no-deps .
 
-RUN rm -rf /src/*
-
-COPY prob_data/* /gw170817_data/
+COPY prob_data/* /prob_data/
 
 WORKDIR /srv
-
 ENTRYPOINT ["/bin/bash"]

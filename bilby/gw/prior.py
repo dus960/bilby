@@ -21,7 +21,11 @@ from .conversion import (
     generate_tidal_parameters, fill_from_fixed_priors,
     generate_all_bbh_parameters,
     chirp_mass_and_mass_ratio_to_total_mass,
-    total_mass_and_mass_ratio_to_component_masses)
+    total_mass_and_mass_ratio_to_component_masses,
+    component_masses_to_chirp_mass,
+    lambda_1_lambda_2_to_lambda_tilde,
+    lambda_1_lambda_2_to_delta_lambda_tilde,
+    lambda_tilde_delta_lambda_tilde_to_lambda_1_lambda_2)
 from .cosmology import get_cosmology, z_at_value
 from .source import PARAMETER_SETS
 from .utils import calculate_time_to_merger
@@ -1853,6 +1857,9 @@ class TOVJointDist(BaseJointPriorDist):
         self.distname = "tov_joint_" + "_".join(names)
 
         pdf = np.exp(log_pdf)
+        # Raw table, kept for TOVConditionalLambdaPrior, which integrates the
+        # interpolant below analytically along log10(Lambda).
+        self._log_pdf = log_pdf
 
         # Interpolant for ln p(mass, log10(Lambda)) itself, used by _ln_prob.
         self._log_pdf_interp = RegularGridInterpolator(
@@ -1876,11 +1883,43 @@ class TOVJointDist(BaseJointPriorDist):
         cond_cdf /= np.clip(cond_cdf[:, -1:], 1e-300, None)
         self._cond_cdf = cond_cdf  # shape (N_mass, N_lambda)
 
-    def _rescale(self, samp, **kwargs):
-        u_mass = samp[:, 0]
-        u_lambda = samp[:, 1]
+    def mass_cdf(self, mass):
+        """CDF of the marginal mass distribution p(mass).
 
-        mass = np.interp(u_mass, self._mass_cdf, self.mass_edges)
+        Parameters
+        ==========
+        mass: array_like
+            Mass values, in the same units as the grid's ``mass_edges``.
+
+        Returns
+        =======
+        array_like: F(mass), clipped to [0, 1] outside the grid.
+        """
+        return np.interp(mass, self.mass_edges, self._mass_cdf)
+
+    def mass_from_cdf(self, u):
+        """Inverse of :meth:`mass_cdf`, i.e. the mass unit-cube rescaling."""
+        return np.interp(u, self._mass_cdf, self.mass_edges)
+
+    def log10_lambda_from_cdf(self, u, mass):
+        """Inverse CDF of p(log10(Lambda) | mass).
+
+        The conditional CDF is tabulated per mass grid point; rows are linearly
+        interpolated in mass before inverting.
+
+        Parameters
+        ==========
+        u: array_like
+            Unit-cube coordinates.
+        mass: array_like
+            Masses to condition on, same shape as :code:`u`.
+
+        Returns
+        =======
+        array_like: log10(Lambda) values.
+        """
+        u = np.atleast_1d(u)
+        mass = np.atleast_1d(mass)
 
         row_idx = np.clip(np.searchsorted(self.mass_edges, mass), 1, len(self.mass_edges) - 1)
         i0, i1 = row_idx - 1, row_idx
@@ -1888,12 +1927,35 @@ class TOVJointDist(BaseJointPriorDist):
         safe_span = np.where(span > 0, span, 1.0)
         w = np.where(span > 0, (mass - self.mass_edges[i0]) / safe_span, 0.0)
 
-        log10_lambda = np.empty_like(mass)
+        log10_lambda = np.empty_like(mass, dtype=float)
         for k in range(len(mass)):
             cdf_row = (1.0 - w[k]) * self._cond_cdf[i0[k]] + w[k] * self._cond_cdf[i1[k]]
-            log10_lambda[k] = np.interp(u_lambda[k], cdf_row, self.log10_lambda_edges)
+            log10_lambda[k] = np.interp(u[k], cdf_row, self.log10_lambda_edges)
+        return log10_lambda
 
-        lam = 10 ** log10_lambda
+    def ln_pdf_mass_lambda(self, mass, lam):
+        """ln p(mass, Lambda) from the gridded KDE.
+
+        The grid holds p(mass, log10(Lambda)); the Jacobian of
+        log10(Lambda) -> Lambda is applied here, so this is a density in
+        Lambda. Returns -inf off the grid.
+        """
+        mass = np.atleast_1d(mass)
+        lam = np.atleast_1d(lam)
+        log10_lam = np.log10(np.clip(lam, 1e-300, None))
+        log_pdf_val = self._log_pdf_interp(np.column_stack([mass, log10_lam]))
+        # p(mass, Lambda) = p(mass, log10 Lambda) / (Lambda * ln(10)),
+        # so the log Jacobian is -log(Lambda) - log(log(10)). NB the second
+        # term is log(log(10)) = 0.834, not log(10) = 2.303: an earlier version
+        # of this had log(10), which left ln_prob low by a constant
+        # 10 / ln(10) = 4.34 per (mass, Lambda) pair. Being constant it did not
+        # bias posteriors, but it did shift the log evidence and made the
+        # density unnormalised.
+        return log_pdf_val - np.log(lam) - np.log(np.log(10.0))
+
+    def _rescale(self, samp, **kwargs):
+        mass = self.mass_from_cdf(samp[:, 0])
+        lam = 10 ** self.log10_lambda_from_cdf(samp[:, 1], mass)
         return np.column_stack([mass, lam])
 
     def _sample(self, size, *, random_state=None, **kwargs):
@@ -1910,13 +1972,7 @@ class TOVJointDist(BaseJointPriorDist):
         # interpolation is done in numpy and converted back on the way out.
         # This makes the class numpy-bound: an xp of cupy/jax would fail here.
         samp = np.asarray(samp)
-        mass = samp[:, 0]
-        lam = samp[:, 1]
-        log10_lam = np.log10(np.clip(lam, 1e-300, None))
-        log_pdf_val = self._log_pdf_interp(np.column_stack([mass, log10_lam]))
-        # Jacobian for p(mass, log10 Lambda) -> p(mass, Lambda):
-        # p(mass, Lambda) = p(mass, log10 Lambda) / (Lambda * ln(10))
-        lnprob_vals = log_pdf_val - np.log(lam) - np.log(10.0)
+        lnprob_vals = self.ln_pdf_mass_lambda(samp[:, 0], samp[:, 1])
         return xp.where(xp.asarray(outbounds), -np.inf, xp.asarray(lnprob_vals))
 
     @xp_wrap
@@ -1987,5 +2043,560 @@ class TOVJointPrior(JointPrior):
 
         Note the masses only avoided this by luck: they are multiplied by
         lal.MSUN_SI before reaching LAL, which collapses them to numpy scalars.
+        """
+        return super().sample(size=size, random_state=random_state, **kwargs)[()]
+
+
+class TOVConditionalLambdaPrior(ConditionalBasePrior):
+    """
+    Conditional prior p(Lambda | mass) on one star's tidal deformability,
+    from the TOV mass-Lambda KDE, for use with an independent mass prior.
+
+    Where :code:`TOVJointDist` draws mass and Lambda together, this prior
+    takes the star's mass from whatever mass prior the run already has and
+    puts the EOS conditional on Lambda alone:
+
+        p(Lambda | m) = p_TOV(m, Lambda) / p_TOV(m)
+
+    The density is the same bilinear-in-ln(p) interpolant that
+    :code:`TOVJointDist.ln_pdf_mass_lambda` evaluates. At fixed mass that
+    interpolant is piecewise linear in log10(Lambda), so the normalisation
+    p_TOV(m) and the inverse CDF used by :meth:`rescale` are computed exactly
+    from it, cell by cell, rather than from separately tabulated CDFs.
+    :meth:`rescale` therefore samples exactly the density :meth:`ln_prob`
+    returns, and that density integrates to one at every mass.
+
+    Masses outside the grid have no conditional: :meth:`ln_prob` returns
+    -inf there and :meth:`rescale` returns nan, so the mass prior should stay
+    inside the grid, or be cut to it with a :code:`Constraint`.
+
+    Must be used in a :code:`ConditionalPriorDict` (e.g.
+    :code:`BNSPriorDict`), which supplies the masses, e.g.
+
+    .. code-block:: python
+
+        priors["mass_1"] = Uniform(1.0, 2.0, "mass_1")
+        priors["mass_2"] = Uniform(1.0, 2.0, "mass_2")
+        priors["lambda_1"] = TOVConditionalLambdaPrior(grid_file, component=1)
+        priors["lambda_2"] = TOVConditionalLambdaPrior(grid_file, component=2)
+    """
+
+    _mass_parameter_options = ("component_masses", "chirp_mass_and_mass_ratio")
+
+    def __init__(self, grid_file, component, mass_parameters="component_masses",
+                 name=None, latex_label=None, unit=None, boundary=None):
+        """
+        Parameters
+        ==========
+        grid_file: str or TOVJointDist
+            Path to the .npz grid used by :code:`TOVJointDist`, or an existing
+            :code:`TOVJointDist` to share its loaded grid.
+        component: int
+            1 or 2: which star this Lambda belongs to.
+        mass_parameters: str
+            Which sampled parameters the mass is read from.
+            ``"component_masses"`` (default) conditions on
+            ``mass_<component>``. ``"chirp_mass_and_mass_ratio"`` conditions on
+            ``chirp_mass`` and ``mass_ratio`` and converts them to the
+            component mass, for runs that sample those and constrain the
+            component masses.
+        name: str, optional
+            Defaults to ``lambda_<component>``.
+        latex_label, unit, boundary:
+            See superclass.
+        """
+        if component not in (1, 2):
+            raise ValueError("component must be 1 or 2")
+        if mass_parameters not in self._mass_parameter_options:
+            raise ValueError(
+                f"mass_parameters must be one of {self._mass_parameter_options}"
+            )
+        if isinstance(grid_file, TOVJointDist):
+            self._grid = grid_file
+            grid_file = grid_file.grid_file
+        else:
+            # The names are internal; this dist is only used for its grid.
+            self._grid = TOVJointDist(grid_file, names=["mass", "lambda"])
+        self.grid_file = grid_file
+        self.component = component
+        self.mass_parameters = mass_parameters
+        if name is None:
+            name = f"lambda_{component}"
+
+        super(TOVConditionalLambdaPrior, self).__init__(
+            name=name, latex_label=latex_label, unit=unit, boundary=boundary,
+            condition_func=self._condition_function,
+            minimum=float(10 ** self._grid.log10_lambda_edges[0]),
+            maximum=float(10 ** self._grid.log10_lambda_edges[-1]),
+        )
+        if mass_parameters == "component_masses":
+            self._required_variables = [f"mass_{component}"]
+        else:
+            self._required_variables = ["chirp_mass", "mass_ratio"]
+        self._warned_off_grid = False
+        # conditional_prior_factory renames the class on instantiation; undo
+        # that, as ConditionalChiInPlane does, so repr and JSON round-trip.
+        self.__class__.__name__ = "TOVConditionalLambdaPrior"
+        self.__class__.__qualname__ = "TOVConditionalLambdaPrior"
+
+    def _condition_function(self, reference_params, **kwargs):
+        # The conditioning is done in the methods below from the masses
+        # themselves; no attribute of the prior changes with the mass.
+        return dict()
+
+    def __repr__(self):
+        return Prior.__repr__(self)
+
+    def get_instantiation_dict(self):
+        return Prior.get_instantiation_dict(self)
+
+    def _mass(self, required_variables):
+        """The conditioning mass, from the required variables."""
+        required_variables.pop("xp", None)
+        if not required_variables:
+            raise ValueError(
+                f"{self.__class__.__name__} needs {self.required_variables}; use it "
+                "in a ConditionalPriorDict (e.g. BNSPriorDict), which supplies them."
+            )
+        self.update_conditions(**required_variables)
+        if self.mass_parameters == "component_masses":
+            return np.asarray(required_variables[f"mass_{self.component}"], dtype=float)
+        chirp_mass = np.asarray(required_variables["chirp_mass"], dtype=float)
+        mass_ratio = np.asarray(required_variables["mass_ratio"], dtype=float)
+        total_mass = chirp_mass_and_mass_ratio_to_total_mass(chirp_mass, mass_ratio)
+        masses = total_mass_and_mass_ratio_to_component_masses(mass_ratio, total_mass)
+        return np.asarray(masses[self.component - 1], dtype=float)
+
+    def _conditional_tables(self, mass):
+        """Per-cell quantities of the interpolant along log10(Lambda) at each mass.
+
+        At fixed mass the bilinear interpolant of ln p(mass, log10 Lambda) is
+        piecewise linear in log10 Lambda, with node values a_j blended
+        linearly in mass. On cell j, of width h_j and slope d_j = a_{j+1} - a_j,
+        the density is exp(a_j + d_j t) for t in [0, 1], so its integral is
+        h_j (e^{a_{j+1}} - e^{a_j}) / d_j. Everything is shifted by the row
+        maximum so the exponentials neither overflow nor all underflow.
+
+        Returns
+        =======
+        valid: mass inside the grid, shape (n,)
+        a: shifted node values, shape (n, M)
+        cum: cumulative cell integrals from 0, shape (n, M)
+        ln_norm: ln of the unshifted total integral, i.e. ln p_TOV(mass)
+        """
+        grid = self._grid
+        edges = grid.mass_edges
+        valid = (mass >= edges[0]) & (mass <= edges[-1])
+        safe_mass = np.where(valid, mass, edges[0])
+        row_idx = np.clip(np.searchsorted(edges, safe_mass), 1, len(edges) - 1)
+        i0, i1 = row_idx - 1, row_idx
+        w = (safe_mass - edges[i0]) / (edges[i1] - edges[i0])
+        a = (1 - w)[:, None] * grid._log_pdf[i0] + w[:, None] * grid._log_pdf[i1]
+        shift = a.max(axis=1)
+        a = a - shift[:, None]
+        e = np.exp(a)
+        d = np.diff(a, axis=1)
+        h = np.diff(grid.log10_lambda_edges)
+        small = np.abs(d) < 1e-8
+        with np.errstate(divide="ignore", invalid="ignore"):
+            cell = h * np.where(small, e[:, :-1] * (1 + d / 2), (e[:, 1:] - e[:, :-1]) / np.where(small, 1.0, d))
+        cum = np.concatenate([np.zeros((len(mass), 1)), np.cumsum(cell, axis=1)], axis=1)
+        ln_norm = np.log(cum[:, -1]) + shift
+        return valid, a, cum, ln_norm
+
+    def _warn_off_grid(self, valid):
+        if not self._warned_off_grid and not np.all(valid):
+            logger.warning(
+                f"{self.name}: conditioning mass outside the TOV grid "
+                f"[{self._grid.mass_edges[0]}, {self._grid.mass_edges[-1]}]; returning nan. "
+                "Restrict the mass prior to the grid or add a Constraint."
+            )
+            self._warned_off_grid = True
+
+    @xp_wrap
+    def rescale(self, val, *, xp=None, **required_variables):
+        """Inverse CDF of p(Lambda | mass), exact for the interpolant.
+
+        Within the cell holding the target probability, the remaining mass
+        rho satisfies h (e^{a_j + d t} - e^{a_j}) / d = rho, solved for t in
+        closed form.
+        """
+        mass = self._mass(required_variables)
+        val, mass = np.broadcast_arrays(np.asarray(val, dtype=float), mass)
+        shape = val.shape
+        u, mass = val.ravel(), mass.ravel()
+        valid, a, cum, _ = self._conditional_tables(mass)
+        self._warn_off_grid(valid)
+
+        n_cells = a.shape[1] - 1
+        rows = np.arange(len(u))
+        target = u * cum[:, -1]
+        j = np.clip(np.sum(cum[:, 1:-1] <= target[:, None], axis=1), 0, n_cells - 1)
+        h = np.diff(self._grid.log10_lambda_edges)[j]
+        rho = target - cum[rows, j]
+        a_j = a[rows, j]
+        d = a[rows, j + 1] - a_j
+        e_j = np.exp(a_j)
+        small = np.abs(d) < 1e-8
+        with np.errstate(divide="ignore", invalid="ignore"):
+            t = np.where(
+                small,
+                rho / (h * e_j),
+                (np.log(np.clip(e_j + rho * d / h, 1e-300, None)) - a_j) / np.where(small, 1.0, d),
+            )
+        t = np.clip(np.nan_to_num(t, nan=0.0), 0.0, 1.0)
+        log10_lambda = self._grid.log10_lambda_edges[j] + t * h
+        lam = np.where(valid, 10 ** log10_lambda, np.nan)
+        return xp.asarray(lam.reshape(shape))[()]
+
+    @xp_wrap
+    def ln_prob(self, val, *, xp=None, **required_variables):
+        """ln p(Lambda | mass) = ln p_TOV(mass, Lambda) - ln p_TOV(mass)."""
+        mass = self._mass(required_variables)
+        val, mass = np.broadcast_arrays(np.asarray(val, dtype=float), mass)
+        shape = val.shape
+        lam, mass = val.ravel(), mass.ravel()
+        valid, _, _, ln_norm = self._conditional_tables(mass)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ln_joint = self._grid.ln_pdf_mass_lambda(np.where(valid, mass, self._grid.mass_edges[0]), lam)
+        out = np.where(valid & (lam > 0), ln_joint - ln_norm, -np.inf)
+        return xp.asarray(out.reshape(shape))[()]
+
+    @xp_wrap
+    def prob(self, val, *, xp=None, **required_variables):
+        return xp.exp(self.ln_prob(val, xp=xp, **required_variables))
+
+    @xp_wrap
+    def cdf(self, val, *, xp=None, **required_variables):
+        """CDF of p(Lambda | mass), exact for the interpolant."""
+        mass = self._mass(required_variables)
+        val, mass = np.broadcast_arrays(np.asarray(val, dtype=float), mass)
+        shape = val.shape
+        lam, mass = val.ravel(), mass.ravel()
+        valid, a, cum, _ = self._conditional_tables(mass)
+        edges = self._grid.log10_lambda_edges
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ell = np.log10(np.clip(lam, 1e-300, None))
+        j = np.clip(np.searchsorted(edges, ell) - 1, 0, len(edges) - 2)
+        rows = np.arange(len(lam))
+        h = np.diff(edges)[j]
+        t = np.clip((ell - edges[j]) / h, 0.0, 1.0)
+        a_j = a[rows, j]
+        d = a[rows, j + 1] - a_j
+        small = np.abs(d) < 1e-8
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            partial = h * np.where(small, np.exp(a_j) * t,
+                                   (np.exp(a_j + d * t) - np.exp(a_j)) / np.where(small, 1.0, d))
+        out = np.clip((cum[rows, j] + partial) / cum[:, -1], 0.0, 1.0)
+        out = np.where(valid, out, np.nan)
+        return xp.asarray(out.reshape(shape))[()]
+
+
+def _lambda_tilde_coefficients(eta):
+    """The four eta-dependent coefficients of the Wade et al. tidal map.
+
+    See :code:`bilby.gw.conversion.lambda_1_lambda_2_to_lambda_tilde` and
+    :code:`..._to_delta_lambda_tilde`, whose definitions these mirror:
+
+        lambda_tilde       = 8 / 13 * (c1 * Lambda_+ + c2 * Lambda_-)
+        delta_lambda_tilde = 1 / 2  * (c3 * Lambda_+ + c4 * Lambda_-)
+
+    with Lambda_+/- = Lambda_1 +/- Lambda_2.
+    """
+    root = np.sqrt(np.clip(1 - 4 * eta, 0, None))
+    c1 = 1 + 7 * eta - 31 * eta ** 2
+    c2 = root * (1 + 9 * eta - 11 * eta ** 2)
+    c3 = root * (1 - 13272 / 1319 * eta + 8944 / 1319 * eta ** 2)
+    c4 = (1 - 15910 / 1319 * eta + 32850 / 1319 * eta ** 2 +
+          3380 / 1319 * eta ** 3)
+    return c1, c2, c3, c4
+
+
+def _ln_abs_det_lambda_tilde_jacobian(eta):
+    """ln |d(lambda_tilde, delta_lambda_tilde) / d(lambda_1, lambda_2)|.
+
+    The Wade et al. map is *linear* in (lambda_1, lambda_2) at fixed masses,
+
+        (lambda_tilde, delta_lambda_tilde)^T = A(eta) (lambda_1, lambda_2)^T,
+
+    so its Jacobian determinant depends on eta alone:
+
+        det A = 8 / 13 * (c2 * c3 - c1 * c4).
+
+    """
+    c1, c2, c3, c4 = _lambda_tilde_coefficients(eta)
+    det = 8 / 13 * (c2 * c3 - c1 * c4)
+    return np.log(np.abs(det))
+
+
+class TOVMassLambdaTildeJointDist(BaseJointPriorDist):
+    """
+    Joint distribution of (chirp mass, mass ratio, lambda_tilde,
+    delta_lambda_tilde) induced by the TOV mass-Lambda KDE.
+
+    Same input grid as :code:`bilby.gw.prior.TOVJointDist`: a 2D KDE of
+    p(mass, log10(Lambda)) built offline from TOV sequences over a population
+    of equations of state. Where :code:`TOVJointDist` puts that correlation on
+    a single (mass, Lambda) pair, this class propagates it into the sampling
+    parameters actually used for BNS runs, so a run in
+    (chirp_mass, mass_ratio, lambda_tilde, delta_lambda_tilde) carries the EOS
+    correlation rather than an independent uniform tidal prior.
+
+    The underlying model is
+
+        (mass_1, Lambda_1), (mass_2, Lambda_2) ~ p_TOV, independently,
+        conditioned on mass_1 >= mass_2,
+
+    pushed through the deterministic maps
+    (mass_1, mass_2) -> (chirp_mass, mass_ratio) and, at fixed masses, the
+    linear Wade et al. map (Lambda_1, Lambda_2) -> (lambda_tilde,
+    delta_lambda_tilde). Both maps are invertible, so the density is exact:
+
+        p(mc, q, lt, dlt) = 2 p(m1, L1) p(m2, L2) * m1^2 / mc / |det A(eta)|
+
+    The full Jacobian is block triangular -- the masses do not depend on the
+    tidal parameters -- so it factorises into the usual m1^2 / mc mass term and
+    the tidal term 1 / |det A|.
+
+    Note the tidal parameters here are the *dependent* pair: a
+    (lambda_tilde, delta_lambda_tilde) rectangle contains points whose implied
+    (Lambda_1, Lambda_2) are negative or off the EOS grid. Those get -inf,
+    which is correct but means the prior volume is not a box; nested samplers
+    should use :meth:`rescale` (via :code:`TOVMassLambdaTildeJointPrior`)
+    rather than rejection.
+    """
+
+    def __init__(self, grid_file, names=None, bounds=None):
+        """
+        Parameters
+        ==========
+        grid_file: str
+            Path to an .npz file with arrays ``mass_edges`` (N,),
+            ``log10_lambda_edges`` (M,), and ``log_pdf`` (N, M) -- the natural
+            log of p(mass, log10(Lambda)) on that grid. The same file used by
+            :code:`TOVJointDist`.
+        names: list, optional
+            Exactly four parameter names, in the order
+            [chirp mass, mass ratio, lambda tilde, delta lambda tilde].
+            Defaults to
+            ``["chirp_mass", "mass_ratio", "lambda_tilde", "delta_lambda_tilde"]``.
+        bounds: list, optional
+            Bounds for each of the four names. Defaults to the extent implied
+            by the grid (see :meth:`default_bounds`); these are outer bounds on
+            a non-rectangular support, so being inside them does not imply
+            finite probability.
+        """
+        if names is None:
+            names = [
+                "chirp_mass", "mass_ratio", "lambda_tilde", "delta_lambda_tilde",
+            ]
+        if len(names) != 4:
+            raise ValueError(
+                "TOVMassLambdaTildeJointDist needs exactly four parameter "
+                "names: [chirp_mass, mass_ratio, lambda_tilde, "
+                "delta_lambda_tilde]"
+            )
+
+        self.grid_file = grid_file
+        # The single-star grid machinery (marginal mass CDF, conditional
+        # Lambda | mass CDF, the KDE interpolant) is reused wholesale; the
+        # names given here are internal and never surface to the sampler.
+        self._grid = TOVJointDist(grid_file, names=["mass", "lambda"])
+
+        if bounds is None:
+            bounds = self.default_bounds()
+        super(TOVMassLambdaTildeJointDist, self).__init__(names=names, bounds=bounds)
+        # See the note in TOVJointDist: ConditionalPriorDict.rescale groups
+        # sibling JointPriors by this string, so it must be unique per instance.
+        self.distname = "tov_mc_q_lambda_tilde_" + "_".join(names)
+
+    @property
+    def mass_edges(self):
+        return self._grid.mass_edges
+
+    @property
+    def log10_lambda_edges(self):
+        return self._grid.log10_lambda_edges
+
+    def default_bounds(self):
+        """Outer bounds on (chirp_mass, mass_ratio, lambda_tilde, delta_lambda_tilde).
+
+        The mass bounds follow analytically from the grid's mass range. The
+        tidal map is linear in (Lambda_1, Lambda_2) at fixed eta, so its
+        extrema over the grid's Lambda range sit at the corners; those are
+        scanned over a mass grid. Deliberately loose -- these only exist to
+        reject clearly invalid samples, with :meth:`_ln_prob` doing the real
+        support check.
+        """
+        m_min = float(self.mass_edges[0])
+        m_max = float(self.mass_edges[-1])
+        lam_min = float(10 ** self.log10_lambda_edges[0])
+        lam_max = float(10 ** self.log10_lambda_edges[-1])
+
+        mc_bounds = (
+            component_masses_to_chirp_mass(m_min, m_min),
+            component_masses_to_chirp_mass(m_max, m_max),
+        )
+        q_bounds = (m_min / m_max, 1.0)
+
+        masses = np.linspace(m_min, m_max, 200)
+        m1, m2 = np.meshgrid(masses, masses, indexing="ij")
+        ordered = m1 >= m2
+        m1, m2 = m1[ordered], m2[ordered]
+        lt_vals, dlt_vals = [], []
+        for lam_1 in (lam_min, lam_max):
+            for lam_2 in (lam_min, lam_max):
+                lt_vals.append(
+                    lambda_1_lambda_2_to_lambda_tilde(lam_1, lam_2, m1, m2))
+                dlt_vals.append(
+                    lambda_1_lambda_2_to_delta_lambda_tilde(lam_1, lam_2, m1, m2))
+        lt_vals = np.concatenate(lt_vals)
+        dlt_vals = np.concatenate(dlt_vals)
+
+        return [
+            (float(mc_bounds[0]), float(mc_bounds[1])),
+            (float(q_bounds[0]), float(q_bounds[1])),
+            (float(np.min(lt_vals)), float(np.max(lt_vals))),
+            (float(np.min(dlt_vals)), float(np.max(dlt_vals))),
+        ]
+
+    def _component_rescale(self, samp):
+        """Unit cube -> (mass_1, mass_2, lambda_1, lambda_2).
+
+        The four unit-cube coordinates are consumed in order as mass_1,
+        then mass_2 given mass_1, then Lambda_1 given mass_1, then Lambda_2
+        given mass_2. Which cube coordinate feeds which physical parameter is
+        arbitrary: ``rescale`` maps the whole vector at once, so the sampler
+        never sees a per-coordinate correspondence.
+
+        The ordering mass_1 >= mass_2 is imposed by the transform itself
+        rather than by rejection, keeping the map a smooth bijection:
+        mass_1 is drawn from the distribution of the *larger* of two draws,
+        whose CDF is F(m)^2, and mass_2 from p(m) truncated to [m_min, m_1].
+        """
+        mass_1 = self._grid.mass_from_cdf(np.sqrt(samp[:, 0]))
+        mass_2 = self._grid.mass_from_cdf(samp[:, 1] * self._grid.mass_cdf(mass_1))
+        lambda_1 = 10 ** self._grid.log10_lambda_from_cdf(samp[:, 2], mass_1)
+        lambda_2 = 10 ** self._grid.log10_lambda_from_cdf(samp[:, 3], mass_2)
+        return mass_1, mass_2, lambda_1, lambda_2
+
+    def _rescale(self, samp, **kwargs):
+        samp = np.asarray(samp)
+        mass_1, mass_2, lambda_1, lambda_2 = self._component_rescale(samp)
+        return np.column_stack([
+            component_masses_to_chirp_mass(mass_1, mass_2),
+            mass_2 / mass_1,
+            lambda_1_lambda_2_to_lambda_tilde(lambda_1, lambda_2, mass_1, mass_2),
+            lambda_1_lambda_2_to_delta_lambda_tilde(lambda_1, lambda_2, mass_1, mass_2),
+        ])
+
+    def _sample(self, size, *, random_state=None, **kwargs):
+        # As in TOVJointDist: honour random_state so seeded runs reproduce and
+        # pool workers get distinct streams.
+        rng = random.resolve_random_state(random_state)
+        return self._rescale(rng.uniform(0, 1, size=(size, 4)))
+
+    @xp_wrap
+    def _ln_prob(self, samp, lnprob, outbounds, *, xp=None):
+        # As in TOVJointDist, the KDE is evaluated with a scipy
+        # RegularGridInterpolator, so the work is done in numpy and converted
+        # back on the way out; an xp of cupy/jax would fail here.
+        samp = np.asarray(samp)
+        chirp_mass, mass_ratio = samp[:, 0], samp[:, 1]
+        lambda_tilde, delta_lambda_tilde = samp[:, 2], samp[:, 3]
+
+        with np.errstate(invalid="ignore", divide="ignore"):
+            total_mass = chirp_mass_and_mass_ratio_to_total_mass(
+                chirp_mass, mass_ratio)
+            mass_1, mass_2 = total_mass_and_mass_ratio_to_component_masses(
+                mass_ratio, total_mass)
+            lambda_1, lambda_2 = lambda_tilde_delta_lambda_tilde_to_lambda_1_lambda_2(
+                lambda_tilde, delta_lambda_tilde, mass_1, mass_2)
+
+            # Points of the (lambda_tilde, delta_lambda_tilde) plane that imply
+            # a negative Lambda for either star are unphysical, not merely
+            # unlikely; likewise mass_ratio outside (0, 1]. Substituting a
+            # harmless in-grid value at those points keeps nan out of the KDE
+            # interpolant; they are masked to -inf below.
+            valid = (
+                (mass_ratio > 0) & (mass_ratio <= 1) & (chirp_mass > 0) &
+                (lambda_1 > 0) & (lambda_2 > 0) &
+                np.isfinite(mass_1) & np.isfinite(mass_2) &
+                np.isfinite(lambda_1) & np.isfinite(lambda_2)
+            )
+            fill_mass = float(self.mass_edges[0])
+            fill_lambda = float(10 ** self.log10_lambda_edges[0])
+            mass_1 = np.where(valid, mass_1, fill_mass)
+            mass_2 = np.where(valid, mass_2, fill_mass)
+            lambda_1 = np.where(valid, lambda_1, fill_lambda)
+            lambda_2 = np.where(valid, lambda_2, fill_lambda)
+            eta = mass_1 * mass_2 / (mass_1 + mass_2) ** 2
+
+            lnprob_vals = (
+                np.log(2.0)  # ordering mass_1 >= mass_2 doubles the density
+                + self._grid.ln_pdf_mass_lambda(mass_1, lambda_1)
+                + self._grid.ln_pdf_mass_lambda(mass_2, lambda_2)
+                # d(mass_1, mass_2) / d(chirp_mass, mass_ratio) = mass_1^2 / chirp_mass
+                + 2 * np.log(mass_1) - np.log(np.where(valid, chirp_mass, 1.0))
+                # d(lambda_1, lambda_2) / d(lambda_tilde, delta_lambda_tilde)
+                - _ln_abs_det_lambda_tilde_jacobian(eta)
+            )
+        lnprob_vals = np.where(valid, lnprob_vals, -np.inf)
+        return xp.where(xp.asarray(outbounds), -np.inf, xp.asarray(lnprob_vals))
+
+    @xp_wrap
+    def ln_prob(self, value, *, xp=None):
+        """Log-probability of a sample, as a scalar for single samples.
+
+        See :meth:`TOVJointDist.ln_prob` for why this override exists.
+        """
+        lnprob = super().ln_prob(value, xp=xp)
+        if getattr(lnprob, "shape", None) == (1,):
+            lnprob = lnprob[0]
+        return lnprob
+
+
+class TOVMassLambdaTildeJointPrior(JointPrior):
+    """
+    A prior distribution following the TOV-informed joint distribution of
+    (chirp_mass, mass_ratio, lambda_tilde, delta_lambda_tilde), for one of
+    those four parameters.
+
+    One instance is created per parameter, all sharing a single
+    :code:`bilby.gw.prior.TOVMassLambdaTildeJointDist`, e.g.
+
+    .. code-block:: python
+
+        dist = TOVMassLambdaTildeJointDist("tov_mass_lambda_joint_kde_grid.npz")
+        priors["chirp_mass"] = TOVMassLambdaTildeJointPrior(dist, "chirp_mass")
+        priors["mass_ratio"] = TOVMassLambdaTildeJointPrior(dist, "mass_ratio")
+        priors["lambda_tilde"] = TOVMassLambdaTildeJointPrior(dist, "lambda_tilde")
+        priors["delta_lambda_tilde"] = TOVMassLambdaTildeJointPrior(
+            dist, "delta_lambda_tilde")
+    """
+
+    def __init__(self, dist, name=None, latex_label=None, unit=None):
+        """
+        Parameters
+        ----------
+        dist: bilby.gw.prior.TOVMassLambdaTildeJointDist
+            The base joint probability.
+        name: str
+            The name of the parameter; one of dist.names.
+        latex_label: str
+            Latex label used for plotting.
+        unit: str
+            The unit of the parameter.
+        """
+        if not isinstance(dist, TOVMassLambdaTildeJointDist):
+            raise JointPriorDistError(
+                "dist object must be instance of TOVMassLambdaTildeJointDist")
+        super(TOVMassLambdaTildeJointPrior, self).__init__(
+            dist=dist, name=name, latex_label=latex_label, unit=unit)
+
+    def sample(self, size=1, *, random_state=None, **kwargs):
+        """Draw a sample, returning a scalar rather than a 0-d array.
+
+        See :meth:`TOVJointPrior.sample` for why this override exists.
         """
         return super().sample(size=size, random_state=random_state, **kwargs)[()]
